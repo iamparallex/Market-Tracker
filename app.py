@@ -169,7 +169,8 @@ def fetch_currency_data():
 @st.cache_data(ttl=CACHE_TTL)
 def fetch_top_performers():
     """For each market, fetch day-change % for a curated set of major-index
-    constituents and return the top gainers, sorted best-first."""
+    constituents and return the top gainers and top losers, each sorted
+    most-extreme-first."""
     results = {}
     for market, universe in TOP_STOCKS_UNIVERSE.items():
         rows = []
@@ -183,8 +184,9 @@ def fetch_top_performers():
                 rows.append({"ticker": ticker, "name": name, "price": last, "change_pct": pct})
             except Exception:
                 continue
-        rows.sort(key=lambda r: r["change_pct"], reverse=True)
-        results[market] = rows[:TOP_PERFORMERS_COUNT]
+        gainers = sorted(rows, key=lambda r: r["change_pct"], reverse=True)[:TOP_PERFORMERS_COUNT]
+        losers = sorted(rows, key=lambda r: r["change_pct"])[:TOP_PERFORMERS_COUNT]
+        results[market] = {"gainers": gainers, "losers": losers}
     return results
 
 
@@ -385,34 +387,48 @@ for tab, (market, items) in zip(tabs, news.items()):
                 st.caption(meta)
             st.divider()
 
-st.subheader("🚀 Top Performing Stocks Today")
+def _render_performer_rows(rows, market):
+    if not rows:
+        st.markdown("_No data available right now._")
+        return
+    for rank, row in enumerate(rows, start=1):
+        pcol, ncol, vcol, ccol = st.columns([0.5, 3, 2, 2])
+        with pcol:
+            st.markdown(f"**#{rank}**")
+        with ncol:
+            st.markdown(f"**{row['name']}**")
+            st.caption(row["ticker"])
+        with vcol:
+            currency = MARKET_CURRENCY.get(market, "")
+            st.markdown(f"{row['price']:,.2f} {currency}")
+        with ccol:
+            pct = row["change_pct"]
+            arrow = "▲" if pct >= 0 else "▼"
+            color = "green" if pct >= 0 else "red"
+            st.markdown(f":{color}[{arrow} {pct:+.2f}%]")
+
+
+st.subheader("📈 Top 10 Gainers Today")
 st.caption(
     f"Top {TOP_PERFORMERS_COUNT} gainers today from a curated set of large, liquid constituents "
     "of each market's major index (S&P 500 · CSI 300 · Nifty 50 · STI). Prices shown in each "
     "market's local currency."
 )
 top_performers = fetch_top_performers()
-perf_tabs = st.tabs(list(top_performers.keys()))
-for tab, (market, rows) in zip(perf_tabs, top_performers.items()):
+gainer_tabs = st.tabs(list(top_performers.keys()))
+for tab, (market, data) in zip(gainer_tabs, top_performers.items()):
     with tab:
-        if not rows:
-            st.markdown("_No data available right now._")
-            continue
-        for rank, row in enumerate(rows, start=1):
-            pcol, ncol, vcol, ccol = st.columns([0.5, 3, 2, 2])
-            with pcol:
-                st.markdown(f"**#{rank}**")
-            with ncol:
-                st.markdown(f"**{row['name']}**")
-                st.caption(row["ticker"])
-            with vcol:
-                currency = MARKET_CURRENCY.get(market, "")
-                st.markdown(f"{row['price']:,.2f} {currency}")
-            with ccol:
-                pct = row["change_pct"]
-                arrow = "▲" if pct >= 0 else "▼"
-                color = "green" if pct >= 0 else "red"
-                st.markdown(f":{color}[{arrow} {pct:+.2f}%]")
+        _render_performer_rows(data["gainers"], market)
+
+st.subheader("📉 Top 10 Losers Today")
+st.caption(
+    f"Top {TOP_PERFORMERS_COUNT} losers today from the same curated set of constituents. "
+    "Prices shown in each market's local currency."
+)
+loser_tabs = st.tabs(list(top_performers.keys()))
+for tab, (market, data) in zip(loser_tabs, top_performers.items()):
+    with tab:
+        _render_performer_rows(data["losers"], market)
 
 st.caption(
     "Data sources: Yahoo Finance (indices/currencies/VIX/yields/top performers), Google News RSS "
