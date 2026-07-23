@@ -11,7 +11,6 @@ import datetime
 import re
 
 import feedparser
-import requests
 import yfinance as yf
 import streamlit as st
 import streamlit.components.v1 as components
@@ -71,8 +70,6 @@ REPUTABLE_SOURCES = [
 # Live S&P 500 sector heat map, embedded directly from Finviz (updates on their end).
 FINVIZ_SP500_MAP_URL = "https://finviz.com/map.ashx?t=sec_all"
 
-_HTTP_HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; MarketTrackerBot/1.0)"}
-
 
 # ---------------------------------------------------------------------------
 # DATA FETCHING (all cached so the app doesn't hammer sources on every click)
@@ -114,69 +111,6 @@ def fetch_currency_data():
     return rows
 
 
-def _extract_image(entry):
-    """Best-effort extraction of a thumbnail/preview image URL from an RSS entry."""
-    # media:thumbnail / media:content (some feeds include these)
-    for attr in ("media_thumbnail", "media_content"):
-        media = getattr(entry, attr, None)
-        if media:
-            url = media[0].get("url")
-            if url:
-                return url
-    # Fall back to scanning the HTML summary/description for an <img> tag
-    html = entry.get("summary", "") or entry.get("description", "")
-    match = re.search(r'<img[^>]+src="([^"]+)"', html)
-    if match:
-        return match.group(1)
-    return None
-
-
-@st.cache_data(ttl=CACHE_TTL)
-def _validate_image(url):
-    """Return the url only if it actually resolves to a loadable image, else None."""
-    if not url:
-        return None
-    try:
-        resp = requests.get(url, timeout=4, stream=True, headers=_HTTP_HEADERS)
-        content_type = resp.headers.get("Content-Type", "")
-        if resp.status_code == 200 and content_type.startswith("image"):
-            return url
-    except Exception:
-        pass
-    return None
-
-
-@st.cache_data(ttl=CACHE_TTL)
-def _fetch_og_image(article_url):
-    """Fallback: follow the article link and pull its og:image meta tag."""
-    if not article_url:
-        return None
-    try:
-        resp = requests.get(article_url, timeout=5, headers=_HTTP_HEADERS, allow_redirects=True)
-        match = re.search(
-            r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)["\']',
-            resp.text, re.IGNORECASE,
-        )
-        if not match:
-            match = re.search(
-                r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+property=["\']og:image["\']',
-                resp.text, re.IGNORECASE,
-            )
-        if match:
-            return _validate_image(match.group(1))
-    except Exception:
-        pass
-    return None
-
-
-def _resolve_image(entry, link):
-    """Get a verified-viewable image URL for a headline, or None if none can be found."""
-    img = _validate_image(_extract_image(entry))
-    if not img:
-        img = _fetch_og_image(link)
-    return img
-
-
 def _source_name(entry):
     src = getattr(entry, "source", None)
     if src is not None:
@@ -207,7 +141,6 @@ def _build_item(entry, source):
         "title": clean_title,
         "link": link,
         "source": source,
-        "image": None,  # resolved lazily, only for headlines we actually keep
         "published": entry.get("published", ""),
     }
 
@@ -232,14 +165,93 @@ def fetch_news():
                 needed = MIN_HEADLINES_PER_MARKET - len(chosen)
                 chosen += fallback[:needed]
 
-            items = []
-            for e, item in chosen:
-                item["image"] = _resolve_image(e, item["link"])
-                items.append(item)
+            items = [item for _, item in chosen]
             news[market] = items or None
         except Exception as e:
-            news[market] = [{"title": f"Error: {e}", "link": "", "source": "", "image": None, "published": ""}]
+            news[market] = [{"title": f"Error: {e}", "link": "", "source": "", "published": ""}]
     return news
+
+
+def _render_ticker(index_rows, currency_rows):
+    """Render a sleek, continuously-scrolling right-to-left ticker banner
+    summarizing every index and currency on the page."""
+    rows = list(index_rows) + list(currency_rows)
+    items_html = []
+    for row in rows:
+        pct = row.get("change_pct")
+        if pct is None:
+            change_html = '<span class="chg flat">—</span>'
+        else:
+            arrow = "▲" if pct >= 0 else "▼"
+            css_class = "up" if pct >= 0 else "down"
+            change_html = f'<span class="chg {css_class}">{arrow} {pct:+.2f}%</span>'
+        items_html.append(
+            f'<span class="tick-item">'
+            f'<span class="tick-label">{row["label"]}</span>'
+            f'<span class="tick-value">{row["value"]}</span>'
+            f'{change_html}'
+            f'</span><span class="tick-sep">•</span>'
+        )
+    # Duplicate the sequence so the CSS animation can loop seamlessly at -50%.
+    strip = "".join(items_html)
+    html = f"""
+    <style>
+    .tick-wrap {{
+        width: 100%;
+        overflow: hidden;
+        background: linear-gradient(90deg, #0d1117 0%, #12161f 50%, #0d1117 100%);
+        border: 1px solid rgba(255,255,255,0.08);
+        border-radius: 10px;
+        padding: 10px 0;
+        margin-bottom: 1.4rem;
+        box-shadow: inset 0 0 20px rgba(0,0,0,0.25);
+    }}
+    .tick-track {{
+        display: inline-flex;
+        white-space: nowrap;
+        animation: tick-scroll 45s linear infinite;
+    }}
+    .tick-wrap:hover .tick-track {{
+        animation-play-state: paused;
+    }}
+    @keyframes tick-scroll {{
+        0%   {{ transform: translateX(0); }}
+        100% {{ transform: translateX(-50%); }}
+    }}
+    .tick-item {{
+        display: inline-flex;
+        align-items: center;
+        font-family: 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace;
+        font-size: 0.82rem;
+        padding: 0 0.9rem;
+    }}
+    .tick-label {{
+        color: #8b96a5;
+        font-weight: 600;
+        letter-spacing: 0.03em;
+        margin-right: 0.5rem;
+        text-transform: uppercase;
+        font-size: 0.72rem;
+    }}
+    .tick-value {{
+        color: #f0f3f7;
+        font-weight: 700;
+        margin-right: 0.5rem;
+    }}
+    .chg {{ font-weight: 600; }}
+    .chg.up {{ color: #3ddc84; }}
+    .chg.down {{ color: #ff5c5c; }}
+    .chg.flat {{ color: #6b7684; }}
+    .tick-sep {{
+        color: #333c48;
+        padding: 0 0.6rem;
+    }}
+    </style>
+    <div class="tick-wrap">
+        <div class="tick-track">{strip}{strip}</div>
+    </div>
+    """
+    st.markdown(html, unsafe_allow_html=True)
 
 
 # ---------------------------------------------------------------------------
@@ -253,6 +265,8 @@ st.caption(f"Last refreshed: {datetime.datetime.now().strftime('%A, %d %b %Y %H:
 
 if st.button("🔄 Refresh now"):
     st.cache_data.clear()
+
+_render_ticker(fetch_index_data(), fetch_currency_data())
 
 st.subheader("Global Indices")
 cols = st.columns(3)
@@ -283,23 +297,15 @@ for tab, (market, items) in zip(tabs, news.items()):
             st.markdown("_No headlines found right now._")
             continue
         for item in items:
-            if item["image"]:
-                card_cols = st.columns([1, 3])
-                with card_cols[0]:
-                    st.image(item["image"], use_container_width=True)
-                text_col = card_cols[1]
+            if item["link"]:
+                st.markdown(f"**[{item['title']}]({item['link']})**")
             else:
-                text_col = st.container()
-            with text_col:
-                if item["link"]:
-                    st.markdown(f"**[{item['title']}]({item['link']})**")
-                else:
-                    st.markdown(f"**{item['title']}**")
-                meta = item["source"] or ""
-                if item["published"]:
-                    meta = f"{meta} · {item['published']}" if meta else item["published"]
-                if meta:
-                    st.caption(meta)
+                st.markdown(f"**{item['title']}**")
+            meta = item["source"] or ""
+            if item["published"]:
+                meta = f"{meta} · {item['published']}" if meta else item["published"]
+            if meta:
+                st.caption(meta)
             st.divider()
 
 st.subheader("🗺️ S&P 500 Heat Map")
