@@ -1,5 +1,5 @@
 """
-Live Market & SG Rates Dashboard (Streamlit)
+Live Market Dashboard (Streamlit)
 =============================================
 Deploy this on Streamlit Community Cloud (free) to get a public link you can
 open from your phone. See DEPLOY.md for the 3-minute setup.
@@ -10,11 +10,10 @@ Data refreshes automatically every 5 minutes (adjustable via CACHE_TTL below).
 import datetime
 import re
 
-import requests
-import pandas as pd
-import streamlit as st
-import yfinance as yf
 import feedparser
+import yfinance as yf
+import streamlit as st
+import streamlit.components.v1 as components
 
 # ---------------------------------------------------------------------------
 # CONFIG
@@ -31,6 +30,9 @@ TICKERS = {
     "STI (Singapore)":    "^STI",
     "CSI 300 (China)":    "000300.SS",
     "Nifty 50 (India)":   "^NSEI",
+    "Nikkei 225 (Japan)": "^N225",
+    "Hang Seng (HSI)":    "^HSI",
+    "US Dollar Index (DXY)": "DX-Y.NYB",
 }
 
 NEWS_FEEDS = {
@@ -40,13 +42,19 @@ NEWS_FEEDS = {
     "India":         "https://news.google.com/rss/search?q=India+stock+market+Sensex+Nifty+when:1d&hl=en-US&gl=US&ceid=US:en",
 }
 HEADLINES_PER_MARKET = 3
+# Google News RSS returns many outlets of wildly varying quality. We only
+# keep headlines whose <source> matches one of these reputable, well-known
+# financial/general news outlets (case-insensitive substring match).
+REPUTABLE_SOURCES = [
+    "Reuters", "Bloomberg", "CNBC", "The Wall Street Journal", "WSJ",
+    "Financial Times", "Associated Press", "AP News", "BBC",
+    "The Straits Times", "Channel News Asia", "CNA", "The Business Times",
+    "MarketWatch", "Barron's", "The Economist", "Forbes", "Nikkei Asia",
+    "South China Morning Post", "The Economic Times", "Livemint",
+]
 
-MAS_CPI_PRESS_PAGE = "https://www.mas.gov.sg/monetary-policy/consumer-price-developments"
-DATA_GOV_CPI_API = (
-    "https://data.gov.sg/api/action/datastore_search"
-    "?resource_id=d_bdaff844e3ef89d39fceb962ff8f0791&limit=1&sort=month desc"
-)
-REQUEST_HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; MarketTrackerBot/1.0)"}
+# Live S&P 500 sector heat map, embedded directly from Finviz (updates on their end).
+FINVIZ_SP500_MAP_URL = "https://finviz.com/map.ashx?t=sec_all"
 
 
 # ---------------------------------------------------------------------------
@@ -72,32 +80,43 @@ def fetch_index_data():
     return rows
 
 
-@st.cache_data(ttl=CACHE_TTL)
-def fetch_inflation():
-    headline = "unavailable"
-    try:
-        r = requests.get(DATA_GOV_CPI_API, headers=REQUEST_HEADERS, timeout=10)
-        r.raise_for_status()
-        records = r.json()["result"]["records"]
-        all_items = next(
-            (rec for rec in records if "all items" in str(rec.get("level_1", "")).lower()),
-            records[0] if records else None,
-        )
-        if all_items:
-            headline = f"{all_items.get('value', 'N/A')} (index, {all_items.get('month', 'N/A')})"
-    except Exception as e:
-        headline = f"unavailable ({e})"
+def _extract_image(entry):
+    """Best-effort extraction of a thumbnail/preview image URL from an RSS entry."""
+    # media:thumbnail / media:content (some feeds include these)
+    for attr in ("media_thumbnail", "media_content"):
+        media = getattr(entry, attr, None)
+        if media:
+            url = media[0].get("url")
+            if url:
+                return url
+    # Fall back to scanning the HTML summary/description for an <img> tag
+    html = entry.get("summary", "") or entry.get("description", "")
+    match = re.search(r'<img[^>]+src="([^"]+)"', html)
+    if match:
+        return match.group(1)
+    return None
 
-    core = "unavailable"
-    try:
-        r = requests.get(MAS_CPI_PRESS_PAGE, headers=REQUEST_HEADERS, timeout=10)
-        r.raise_for_status()
-        match = re.search(r"MAS Core Inflation[^.]{0,200}?(\d+\.\d+)\s*%", r.text, re.IGNORECASE)
-        core = f"{match.group(1)}% (y/y)" if match else "figure not found on page"
-    except Exception as e:
-        core = f"unavailable ({e})"
 
-    return headline, core
+def _source_name(entry):
+    src = getattr(entry, "source", None)
+    if src is not None:
+        title = getattr(src, "title", None)
+        if not title and isinstance(src, dict):
+            title = src.get("title")
+        if title:
+            return title
+    # Google News titles are usually formatted "Headline - Source Name"
+    title = entry.get("title", "")
+    if " - " in title:
+        return title.rsplit(" - ", 1)[-1].strip()
+    return ""
+
+
+def _is_reputable(source_name):
+    if not source_name:
+        return False
+    lname = source_name.lower()
+    return any(rep.lower() in lname for rep in REPUTABLE_SOURCES)
 
 
 @st.cache_data(ttl=CACHE_TTL)
@@ -106,9 +125,26 @@ def fetch_news():
     for market, url in NEWS_FEEDS.items():
         try:
             feed = feedparser.parse(url)
-            news[market] = [e.title for e in feed.entries[:HEADLINES_PER_MARKET]] or ["No headlines found."]
+            items = []
+            for e in feed.entries:
+                source = _source_name(e)
+                if not _is_reputable(source):
+                    continue
+                title = e.get("title", "Untitled")
+                # Strip the trailing " - Source Name" Google News appends
+                clean_title = re.sub(r"\s*-\s*" + re.escape(source) + r"\s*$", "", title) if source else title
+                items.append({
+                    "title": clean_title,
+                    "link": e.get("link", ""),
+                    "source": source,
+                    "image": _extract_image(e),
+                    "published": e.get("published", ""),
+                })
+                if len(items) >= HEADLINES_PER_MARKET:
+                    break
+            news[market] = items or None
         except Exception as e:
-            news[market] = [f"Error: {e}"]
+            news[market] = [{"title": f"Error: {e}", "link": "", "source": "", "image": None, "published": ""}]
     return news
 
 
@@ -134,16 +170,38 @@ for i, row in enumerate(fetch_index_data()):
             st.metric(row["label"], row["value"], f"{row['change_pct']:+.2f}%")
 
 st.subheader("📰 Live Market News — SG, US, China, India")
+st.caption("Only showing headlines from reputable outlets (Reuters, Bloomberg, CNBC, FT, WSJ, AP, BBC, and similar).")
 news = fetch_news()
 tabs = st.tabs(list(news.keys()))
-for tab, (market, headlines) in zip(tabs, news.items()):
+for tab, (market, items) in zip(tabs, news.items()):
     with tab:
-        for h in headlines:
-            st.markdown(f"- {h}")
+        if not items:
+            st.markdown("_No headlines from reputable sources found right now._")
+            continue
+        for item in items:
+            card_cols = st.columns([1, 3])
+            with card_cols[0]:
+                if item["image"]:
+                    st.image(item["image"], use_container_width=True)
+            with card_cols[1]:
+                if item["link"]:
+                    st.markdown(f"**[{item['title']}]({item['link']})**")
+                else:
+                    st.markdown(f"**{item['title']}**")
+                meta = item["source"] or ""
+                if item["published"]:
+                    meta = f"{meta} · {item['published']}" if meta else item["published"]
+                if meta:
+                    st.caption(meta)
+            st.divider()
 
-st.divider()
+st.subheader("🗺️ S&P 500 Heat Map")
+st.caption("Live sector/stock heat map, embedded directly from Finviz — colors and sizes update on their end in real time.")
+components.iframe(FINVIZ_SP500_MAP_URL, height=650, scrolling=True)
+st.link_button("Open full map on Finviz ↗", FINVIZ_SP500_MAP_URL)
+
 st.caption(
-    "Data sources: Yahoo Finance (indices/VIX/yields), data.gov.sg (CPI), "
-    "MAS website (Core Inflation), Google News RSS (headlines). "
+    "Data sources: Yahoo Finance (indices/VIX/yields/DXY), Google News RSS "
+    "(headlines, filtered to reputable outlets), Finviz (S&P 500 heat map). "
     "This is informational only, not financial advice."
 )
