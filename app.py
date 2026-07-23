@@ -141,14 +141,6 @@ for tab, (market, headlines) in zip(tabs, news.items()):
         for h in headlines:
             st.markdown(f"- {h}")
 
-st.subheader("🇸🇬 Singapore Inflation")
-headline, core = fetch_inflation()
-c1, c2 = st.columns(2)
-with c1:
-    st.metric("Headline CPI", headline)
-with c2:
-    st.metric("MAS Core Inflation", core)
-
 st.divider()
 st.caption(
     "Data sources: Yahoo Finance (indices/VIX/yields), data.gov.sg (CPI), "
