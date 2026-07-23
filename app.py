@@ -13,7 +13,6 @@ import re
 import feedparser
 import yfinance as yf
 import streamlit as st
-import streamlit.components.v1 as components
 
 # ---------------------------------------------------------------------------
 # CONFIG
@@ -46,6 +45,57 @@ CURRENCIES = {
     "NZD/USD":                {"ticker": "NZDUSD=X", "invert": False},  # already NZD->USD
 }
 
+# Curated set of large, liquid constituents from each market's major index,
+# used to surface the day's top performers. Not the full index membership
+# (some indexes, e.g. CSI 300, run to hundreds of names) — this is a
+# representative slate of the bigger, more liquid names in each.
+TOP_STOCKS_UNIVERSE = {
+    "United States": {  # S&P 500 blue chips
+        "AAPL": "Apple", "MSFT": "Microsoft", "NVDA": "Nvidia", "GOOGL": "Alphabet",
+        "AMZN": "Amazon", "META": "Meta Platforms", "TSLA": "Tesla", "BRK-B": "Berkshire Hathaway",
+        "JPM": "JPMorgan Chase", "V": "Visa", "MA": "Mastercard", "UNH": "UnitedHealth",
+        "JNJ": "Johnson & Johnson", "XOM": "ExxonMobil", "PG": "Procter & Gamble",
+        "HD": "Home Depot", "COST": "Costco", "AVGO": "Broadcom", "ORCL": "Oracle",
+        "KO": "Coca-Cola", "PEP": "PepsiCo", "DIS": "Disney", "NFLX": "Netflix",
+        "AMD": "AMD", "CRM": "Salesforce", "BAC": "Bank of America", "ABBV": "AbbVie",
+        "WMT": "Walmart", "ADBE": "Adobe", "PFE": "Pfizer",
+    },
+    "China": {  # CSI 300 heavyweights
+        "600519.SS": "Kweichow Moutai", "601318.SS": "Ping An Insurance",
+        "000858.SZ": "Wuliangye", "600036.SS": "China Merchants Bank",
+        "300750.SZ": "CATL", "601899.SS": "Zijin Mining", "601398.SS": "ICBC",
+        "000333.SZ": "Midea Group", "601288.SS": "Agricultural Bank of China",
+        "600030.SS": "CITIC Securities", "601988.SS": "Bank of China",
+        "600276.SS": "Hengrui Medicine", "002594.SZ": "BYD", "601088.SS": "China Shenhua",
+        "600809.SS": "Shanxi Fenjiu", "601166.SS": "Industrial Bank",
+        "300059.SZ": "East Money Information", "601328.SS": "Bank of Communications",
+        "600887.SS": "Yili Group", "000651.SZ": "Gree Electric",
+    },
+    "India": {  # Nifty 50 heavyweights
+        "RELIANCE.NS": "Reliance Industries", "TCS.NS": "Tata Consultancy Services",
+        "HDFCBANK.NS": "HDFC Bank", "ICICIBANK.NS": "ICICI Bank", "INFY.NS": "Infosys",
+        "HINDUNILVR.NS": "Hindustan Unilever", "ITC.NS": "ITC", "SBIN.NS": "State Bank of India",
+        "BHARTIARTL.NS": "Bharti Airtel", "KOTAKBANK.NS": "Kotak Mahindra Bank",
+        "LT.NS": "Larsen & Toubro", "BAJFINANCE.NS": "Bajaj Finance",
+        "ASIANPAINT.NS": "Asian Paints", "MARUTI.NS": "Maruti Suzuki", "AXISBANK.NS": "Axis Bank",
+        "SUNPHARMA.NS": "Sun Pharma", "TITAN.NS": "Titan Company", "ULTRACEMCO.NS": "UltraTech Cement",
+        "WIPRO.NS": "Wipro", "NTPC.NS": "NTPC", "TATAMOTORS.NS": "Tata Motors",
+        "ADANIENT.NS": "Adani Enterprises", "HCLTECH.NS": "HCL Technologies",
+        "M&M.NS": "Mahindra & Mahindra", "POWERGRID.NS": "Power Grid Corp",
+    },
+    "Singapore": {  # Straits Times Index (STI) constituents
+        "D05.SI": "DBS Group", "O39.SI": "OCBC Bank", "U11.SI": "UOB",
+        "C6L.SI": "Singapore Airlines", "Z74.SI": "Singtel", "S68.SI": "SGX",
+        "C38U.SI": "CapitaLand Integrated Comm. Trust", "A17U.SI": "Ascendas REIT",
+        "C31.SI": "CapitaLand Investment", "F34.SI": "Wilmar International",
+        "Y92.SI": "Thai Beverage", "G13.SI": "Genting Singapore", "BN4.SI": "Keppel Ltd",
+        "N2IU.SI": "Mapletree Pan Asia Comm. Trust", "ME8U.SI": "Mapletree Industrial Trust",
+        "M44U.SI": "Mapletree Logistics Trust", "9CI.SI": "CapitaLand China Trust",
+        "V03.SI": "Venture Corporation", "S63.SI": "ST Engineering", "U96.SI": "Sembcorp Industries",
+    },
+}
+TOP_PERFORMERS_COUNT = 5  # how many top gainers to show per market
+
 NEWS_FEEDS = {
     "Singapore":     "https://news.google.com/rss/search?q=Singapore+STI+stock+market+when:1d&hl=en-US&gl=US&ceid=US:en",
     "United States": "https://news.google.com/rss/search?q=stock+market+US+when:1d&hl=en-US&gl=US&ceid=US:en",
@@ -66,9 +116,6 @@ REPUTABLE_SOURCES = [
     "MarketWatch", "Barron's", "The Economist", "Forbes", "Nikkei Asia",
     "South China Morning Post", "The Economic Times", "Livemint",
 ]
-
-# Live S&P 500 sector heat map, embedded directly from Finviz (updates on their end).
-FINVIZ_SP500_MAP_URL = "https://finviz.com/map.ashx?t=sec_all"
 
 
 # ---------------------------------------------------------------------------
@@ -109,6 +156,28 @@ def fetch_currency_data():
         except Exception as e:
             rows.append({"label": label, "value": "N/A", "change_pct": None, "error": str(e)})
     return rows
+
+
+@st.cache_data(ttl=CACHE_TTL)
+def fetch_top_performers():
+    """For each market, fetch day-change % for a curated set of major-index
+    constituents and return the top gainers, sorted best-first."""
+    results = {}
+    for market, universe in TOP_STOCKS_UNIVERSE.items():
+        rows = []
+        for ticker, name in universe.items():
+            try:
+                info = yf.Ticker(ticker).fast_info
+                last, prev = info["lastPrice"], info["previousClose"]
+                if not prev:
+                    continue
+                pct = (last - prev) / prev * 100
+                rows.append({"ticker": ticker, "name": name, "price": last, "change_pct": pct})
+            except Exception:
+                continue
+        rows.sort(key=lambda r: r["change_pct"], reverse=True)
+        results[market] = rows[:TOP_PERFORMERS_COUNT]
+    return results
 
 
 def _source_name(entry):
@@ -308,13 +377,35 @@ for tab, (market, items) in zip(tabs, news.items()):
                 st.caption(meta)
             st.divider()
 
-st.subheader("🗺️ S&P 500 Heat Map")
-st.caption("Live sector/stock heat map, embedded directly from Finviz — colors and sizes update on their end in real time.")
-components.iframe(FINVIZ_SP500_MAP_URL, height=650, scrolling=True)
-st.link_button("Open full map on Finviz ↗", FINVIZ_SP500_MAP_URL)
+st.subheader("🚀 Top Performing Stocks Today")
+st.caption(
+    f"Top {TOP_PERFORMERS_COUNT} gainers today from a curated set of large, liquid constituents "
+    "of each market's major index (S&P 500 · CSI 300 · Nifty 50 · STI)."
+)
+top_performers = fetch_top_performers()
+perf_tabs = st.tabs(list(top_performers.keys()))
+for tab, (market, rows) in zip(perf_tabs, top_performers.items()):
+    with tab:
+        if not rows:
+            st.markdown("_No data available right now._")
+            continue
+        for rank, row in enumerate(rows, start=1):
+            pcol, ncol, vcol, ccol = st.columns([0.5, 3, 2, 2])
+            with pcol:
+                st.markdown(f"**#{rank}**")
+            with ncol:
+                st.markdown(f"**{row['name']}**")
+                st.caption(row["ticker"])
+            with vcol:
+                st.markdown(f"{row['price']:,.2f}")
+            with ccol:
+                pct = row["change_pct"]
+                arrow = "▲" if pct >= 0 else "▼"
+                color = "green" if pct >= 0 else "red"
+                st.markdown(f":{color}[{arrow} {pct:+.2f}%]")
 
 st.caption(
-    "Data sources: Yahoo Finance (indices/currencies/VIX/yields), Google News RSS "
-    "(headlines, prioritizing reputable outlets), Finviz (S&P 500 heat map). "
+    "Data sources: Yahoo Finance (indices/currencies/VIX/yields/top performers), Google News RSS "
+    "(headlines, prioritizing reputable outlets). "
     "This is informational only, not financial advice."
 )
