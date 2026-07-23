@@ -29,22 +29,18 @@ TICKERS = {
     "VIX":                "^VIX",
     "10Y Treasury Yield":  "^TNX",
     "STI (Singapore)":    "^STI",
+    "CSI 300 (China)":    "000300.SS",
+    "Nifty 50 (India)":   "^NSEI",
 }
 
 NEWS_FEEDS = {
-    "United States": "https://news.google.com/rss/search?q=stock+market+US+when:1d&hl=en-US&gl=US&ceid=US:en",
-    "China":         "https://news.google.com/rss/search?q=China+stock+market+when:1d&hl=en-US&gl=US&ceid=US:en",
-    "India":         "https://news.google.com/rss/search?q=India+stock+market+Sensex+Nifty+when:1d&hl=en-US&gl=US&ceid=US:en",
     "Singapore":     "https://news.google.com/rss/search?q=Singapore+STI+stock+market+when:1d&hl=en-US&gl=US&ceid=US:en",
+    "United States": "https://news.google.com/rss/search?q=stock+market+US+when:1d&hl=en-US&gl=US&ceid=US:en",
+    "China":         "https://news.google.com/rss/search?q=China+stock+market+CSI300+when:1d&hl=en-US&gl=US&ceid=US:en",
+    "India":         "https://news.google.com/rss/search?q=India+stock+market+Sensex+Nifty+when:1d&hl=en-US&gl=US&ceid=US:en",
 }
 HEADLINES_PER_MARKET = 3
 
-MAS_SORA_API = (
-    "https://eservices.mas.gov.sg/api/action/datastore/search.json"
-    "?resource_id=9a0bf149-308c-4bd2-832d-76c8e6cb47ed&limit=1&sort=end_of_day desc"
-)
-MAS_TBILL_AUCTIONS_PAGE = "https://eservices.mas.gov.sg/statistics/fdanet/TreasuryBillAuctions.aspx"
-MAS_SSB_PAGE = "https://www.mas.gov.sg/bonds-and-bills/singapore-savings-bonds"
 MAS_CPI_PRESS_PAGE = "https://www.mas.gov.sg/monetary-policy/consumer-price-developments"
 DATA_GOV_CPI_API = (
     "https://data.gov.sg/api/action/datastore_search"
@@ -74,46 +70,6 @@ def fetch_index_data():
         except Exception as e:
             rows.append({"label": label, "value": "N/A", "change_pct": None, "error": str(e)})
     return rows
-
-
-@st.cache_data(ttl=CACHE_TTL)
-def fetch_sora():
-    try:
-        r = requests.get(MAS_SORA_API, headers=REQUEST_HEADERS, timeout=10)
-        r.raise_for_status()
-        rec = r.json()["result"]["records"][0]
-        return {
-            "date": rec.get("end_of_day", "N/A"),
-            "sora": rec.get("sora", "N/A"),
-            "comp_1m": rec.get("comp_sora_1m", "N/A"),
-            "comp_3m": rec.get("comp_sora_3m", "N/A"),
-        }
-    except Exception as e:
-        return {"error": str(e)}
-
-
-@st.cache_data(ttl=CACHE_TTL)
-def fetch_tbill_rates():
-    try:
-        r = requests.get(MAS_TBILL_AUCTIONS_PAGE, headers=REQUEST_HEADERS, timeout=10)
-        r.raise_for_status()
-        tables = pd.read_html(r.text)
-        df = max(tables, key=len)
-        return df.head(3)
-    except Exception as e:
-        return str(e)
-
-
-@st.cache_data(ttl=CACHE_TTL)
-def fetch_ssb_rates():
-    try:
-        r = requests.get(MAS_SSB_PAGE, headers=REQUEST_HEADERS, timeout=10)
-        r.raise_for_status()
-        tables = pd.read_html(r.text)
-        df = max(tables, key=len)
-        return df.head(3)
-    except Exception as e:
-        return str(e)
 
 
 @st.cache_data(ttl=CACHE_TTL)
@@ -177,43 +133,7 @@ for i, row in enumerate(fetch_index_data()):
         else:
             st.metric(row["label"], row["value"], f"{row['change_pct']:+.2f}%")
 
-st.subheader("🇸🇬 Singapore Rates & Inflation")
-sora = fetch_sora()
-c1, c2, c3, c4 = st.columns(4)
-with c1:
-    if "error" in sora:
-        st.metric("SORA", "N/A")
-    else:
-        st.metric("SORA", f"{sora['sora']}%", help=f"As at {sora['date']}")
-with c2:
-    if "error" not in sora:
-        st.metric("1M Compounded SORA", f"{sora['comp_1m']}%")
-with c3:
-    headline, core = fetch_inflation()
-    st.metric("Headline CPI", headline)
-with c4:
-    st.metric("MAS Core Inflation", core)
-
-col_a, col_b = st.columns(2)
-with col_a:
-    st.markdown("**T-bill auction results (latest)**")
-    tbills = fetch_tbill_rates()
-    if isinstance(tbills, str):
-        st.caption(f"Unavailable via scraper: {tbills}")
-        st.link_button("Check manually on MAS", MAS_TBILL_AUCTIONS_PAGE)
-    else:
-        st.dataframe(tbills, use_container_width=True, hide_index=True)
-
-with col_b:
-    st.markdown("**Singapore Savings Bond (SSB) rates (latest)**")
-    ssb = fetch_ssb_rates()
-    if isinstance(ssb, str):
-        st.caption(f"Unavailable via scraper: {ssb}")
-        st.link_button("Check manually on MAS", MAS_SSB_PAGE)
-    else:
-        st.dataframe(ssb, use_container_width=True, hide_index=True)
-
-st.subheader("📰 Headline News by Market")
+st.subheader("📰 Live Market News — SG, US, China, India")
 news = fetch_news()
 tabs = st.tabs(list(news.keys()))
 for tab, (market, headlines) in zip(tabs, news.items()):
@@ -221,9 +141,17 @@ for tab, (market, headlines) in zip(tabs, news.items()):
         for h in headlines:
             st.markdown(f"- {h}")
 
+st.subheader("🇸🇬 Singapore Inflation")
+headline, core = fetch_inflation()
+c1, c2 = st.columns(2)
+with c1:
+    st.metric("Headline CPI", headline)
+with c2:
+    st.metric("MAS Core Inflation", core)
+
 st.divider()
 st.caption(
-    "Data sources: Yahoo Finance (indices/VIX/yields), MAS eServices API (SORA), "
-    "MAS website (T-bills, SSB), data.gov.sg (CPI), Google News RSS (headlines). "
+    "Data sources: Yahoo Finance (indices/VIX/yields), data.gov.sg (CPI), "
+    "MAS website (Core Inflation), Google News RSS (headlines). "
     "This is informational only, not financial advice."
 )
