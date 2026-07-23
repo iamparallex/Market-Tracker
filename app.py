@@ -94,7 +94,15 @@ TOP_STOCKS_UNIVERSE = {
         "V03.SI": "Venture Corporation", "S63.SI": "ST Engineering", "U96.SI": "Sembcorp Industries",
     },
 }
-TOP_PERFORMERS_COUNT = 5  # how many top gainers to show per market
+TOP_PERFORMERS_COUNT = 10  # how many top gainers to show per market
+
+# Currency each market's share prices are quoted in (for display purposes).
+MARKET_CURRENCY = {
+    "United States": "USD",
+    "China": "CNY",
+    "India": "INR",
+    "Singapore": "SGD",
+}
 
 NEWS_FEEDS = {
     "Singapore":     "https://news.google.com/rss/search?q=Singapore+STI+stock+market+when:1d&hl=en-US&gl=US&ceid=US:en",
@@ -380,7 +388,8 @@ for tab, (market, items) in zip(tabs, news.items()):
 st.subheader("🚀 Top Performing Stocks Today")
 st.caption(
     f"Top {TOP_PERFORMERS_COUNT} gainers today from a curated set of large, liquid constituents "
-    "of each market's major index (S&P 500 · CSI 300 · Nifty 50 · STI)."
+    "of each market's major index (S&P 500 · CSI 300 · Nifty 50 · STI). Prices shown in each "
+    "market's local currency."
 )
 top_performers = fetch_top_performers()
 perf_tabs = st.tabs(list(top_performers.keys()))
@@ -397,7 +406,8 @@ for tab, (market, rows) in zip(perf_tabs, top_performers.items()):
                 st.markdown(f"**{row['name']}**")
                 st.caption(row["ticker"])
             with vcol:
-                st.markdown(f"{row['price']:,.2f}")
+                currency = MARKET_CURRENCY.get(market, "")
+                st.markdown(f"{row['price']:,.2f} {currency}")
             with ccol:
                 pct = row["change_pct"]
                 arrow = "▲" if pct >= 0 else "▼"
