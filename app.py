@@ -9,6 +9,7 @@ Data refreshes automatically every 5 minutes (adjustable via CACHE_TTL below).
 
 import datetime
 import re
+from urllib.parse import quote_plus
 
 import feedparser
 import yfinance as yf
@@ -115,12 +116,12 @@ TOP_STOCKS_UNIVERSE = {
 PMI_FEEDS = {
     ("United States", "Manufacturing"): "https://news.google.com/rss/search?q=%22ISM+Manufacturing+PMI%22+when:35d&hl=en-US&gl=US&ceid=US:en",
     ("United States", "Services"):      "https://news.google.com/rss/search?q=%22ISM+Services+PMI%22+when:35d&hl=en-US&gl=US&ceid=US:en",
-    ("China", "Manufacturing"):         "https://news.google.com/rss/search?q=China+manufacturing+PMI+NBS+when:35d&hl=en-US&gl=US&ceid=US:en",
-    ("China", "Services"):              "https://news.google.com/rss/search?q=China+non-manufacturing+PMI+when:35d&hl=en-US&gl=US&ceid=US:en",
-    ("India", "Manufacturing"):         "https://news.google.com/rss/search?q=India+%22Manufacturing+PMI%22+S%26P+Global+when:35d&hl=en-US&gl=US&ceid=US:en",
-    ("India", "Services"):              "https://news.google.com/rss/search?q=India+%22Services+PMI%22+S%26P+Global+when:35d&hl=en-US&gl=US&ceid=US:en",
+    ("China", "Manufacturing"):         "https://news.google.com/rss/search?q=China+manufacturing+PMI+when:35d&hl=en-US&gl=US&ceid=US:en",
+    ("China", "Services"):              "https://news.google.com/rss/search?q=(China+non-manufacturing+PMI+OR+China+services+PMI)+when:35d&hl=en-US&gl=US&ceid=US:en",
+    ("India", "Manufacturing"):         "https://news.google.com/rss/search?q=(India+Manufacturing+PMI+OR+HSBC+India+Manufacturing+PMI)+when:35d&hl=en-US&gl=US&ceid=US:en",
+    ("India", "Services"):              "https://news.google.com/rss/search?q=(India+Services+PMI+OR+HSBC+India+Services+PMI)+when:35d&hl=en-US&gl=US&ceid=US:en",
     ("Singapore", "Manufacturing"):     "https://news.google.com/rss/search?q=Singapore+Manufacturing+PMI+SIPMM+when:35d&hl=en-US&gl=US&ceid=US:en",
-    ("Singapore", "Services"):          "https://news.google.com/rss/search?q=Singapore+PMI+%22S%26P+Global%22+when:35d&hl=en-US&gl=US&ceid=US:en",
+    ("Singapore", "Services"):          "https://news.google.com/rss/search?q=(Singapore+PMI+S%26P+Global+OR+Singapore+private+sector+PMI)+when:35d&hl=en-US&gl=US&ceid=US:en",
 }
 
 TOP_PERFORMERS_COUNT = 10  # how many top gainers to show per market
@@ -295,7 +296,24 @@ def fetch_pmi_data():
                 source = _source_name(e)
                 item = _build_item(e, source)
                 (reputable if _is_reputable(source) else fallback).append(item)
-            chosen = (reputable or fallback)
+            chosen = reputable or fallback
+
+            # If our (deliberately specific) query above matched nothing at
+            # all, retry once with a plain, generic query before giving up —
+            # this keeps a country/type from silently going blank just
+            # because outlets phrased a headline differently than expected.
+            if not chosen:
+                generic_q = quote_plus(f"{country} {kind} PMI")
+                generic_url = (f"https://news.google.com/rss/search?q={generic_q}"
+                               f"+when:35d&hl=en-US&gl=US&ceid=US:en")
+                feed = feedparser.parse(generic_url)
+                reputable, fallback = [], []
+                for e in feed.entries:
+                    source = _source_name(e)
+                    item = _build_item(e, source)
+                    (reputable if _is_reputable(source) else fallback).append(item)
+                chosen = reputable or fallback
+
             if not chosen:
                 results[country][kind] = None
                 continue
