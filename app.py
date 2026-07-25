@@ -164,20 +164,40 @@ EMPLOYMENT_METRICS = {
     ("China", "Unemployment Rate"): {
         "kind": "rate",
         "window": "35d",
-        "variants": ["China surveyed urban unemployment rate NBS", "China unemployment rate"],
+        # "-youth" tries to steer the query away from China's separate,
+        # much-higher youth-unemployment figure (a distinct, heavily
+        # reported series); we also filter any "youth" headline out in code
+        # below as a backstop, since the query-level exclusion isn't
+        # guaranteed to work on every source.
+        "variants": [
+            "China surveyed urban unemployment rate NBS -youth",
+            "China unemployment rate -youth",
+        ],
     },
     ("India", "Unemployment Rate"): {
         "kind": "rate",
         "window": "35d",
-        "variants": ["India unemployment rate CMIE", "India unemployment rate MoSPI"],
+        "variants": [
+            "India unemployment rate CMIE", "India unemployment rate MoSPI",
+            "India unemployment rate PLFS", "India jobless rate",
+        ],
     },
     ("Singapore", "Unemployment Rate"): {
         "kind": "rate",
         "window": "100d",
-        "variants": ["Singapore unemployment rate MOM", "Singapore unemployment rate Ministry of Manpower"],
+        "variants": [
+            "Singapore unemployment rate MOM", "Singapore unemployment rate Ministry of Manpower",
+            "Singapore resident unemployment rate",
+        ],
     },
 }
-EMPLOYMENT_CANDIDATES_TO_SCAN = 6  # how many headlines per query variant to check for a parseable number
+EMPLOYMENT_CANDIDATES_TO_SCAN = 8  # how many headlines per query variant to check for a parseable number
+# Headlines containing any of these are skipped for rate parsing even if they
+# have a percent figure — they report a related-but-different, much more
+# volatile sub-metric (e.g. China and India both separately report youth
+# unemployment, which runs far higher than the overall/general rate) that
+# would otherwise get misattributed as the headline figure.
+EMPLOYMENT_RATE_EXCLUDE_TERMS = ["youth", "graduate", "young people"]
 
 TOP_PERFORMERS_COUNT = 10  # how many top gainers to show per market
 
@@ -319,38 +339,43 @@ def _parse_pmi_value(title, keyword=None):
 
     `keyword` (e.g. "services" or "manufacturing") disambiguates headlines
     that report BOTH figures at once, e.g. "India factory PMI at 58.4 as
-    services PMI eases to 60.5" — without this, the manufacturing figure
-    would be picked up first and wrongly attributed to services (or vice
-    versa). When both PMI-type words appear in the title, we first narrow
-    the search to the text around `keyword` before falling back to the
-    whole title.
+    services PMI eases to 60.5" — without this, whichever figure appears
+    first in the title would get picked up regardless of type. When a
+    pattern has more than one match in the title, we pick whichever match
+    sits closest to the keyword's position rather than always taking the
+    first — this avoids the earlier bug of truncating the title down to a
+    small window around the keyword, which could cut off the number
+    entirely when it's not immediately adjacent to the keyword.
     """
-    search_text = title
+    keyword_pos = None
     if keyword:
-        other_terms = {"manufacturing", "services", "non-manufacturing"} - {keyword.lower()}
         km = re.search(re.escape(keyword), title, re.IGNORECASE)
-        mentions_other = any(re.search(re.escape(t), title, re.IGNORECASE) for t in other_terms)
-        if km and mentions_other:
-            # Scope to a window around the keyword so the "other" type's
-            # number (which may appear earlier/later in the same headline)
-            # isn't picked up instead.
-            start = max(0, km.start() - 15)
-            end = km.end() + 60
-            search_text = title[start:end]
+        if km:
+            keyword_pos = km.start()
+
+    def _best(matches):
+        if not matches:
+            return None
+        if keyword_pos is None or len(matches) == 1:
+            return matches[0]
+        return min(matches, key=lambda mm: abs(mm.start() - keyword_pos))
 
     # Pattern 1: two numbers linked by "... from ..." (gives current + prior)
-    m = re.search(
+    matches = list(re.finditer(
         r"(\d{2,3}(?:\.\d+)?)\s*%?[^.\n]{0,45}?\bfrom\b\s*(\d{2,3}(?:\.\d+)?)",
-        search_text, re.IGNORECASE,
-    )
+        title, re.IGNORECASE,
+    ))
+    m = _best(matches)
     if m:
         return float(m.group(1)), float(m.group(2))
     # Pattern 2: a single "NN.N%" figure
-    m = re.search(r"(\d{2,3}(?:\.\d+)?)\s*%", search_text)
+    matches = list(re.finditer(r"(\d{2,3}(?:\.\d+)?)\s*%", title))
+    m = _best(matches)
     if m:
         return float(m.group(1)), None
     # Pattern 3: "PMI ... <number>" without a percent sign
-    m = re.search(r"PMI\D{0,15}(\d{2,3}(?:\.\d+)?)", search_text, re.IGNORECASE)
+    matches = list(re.finditer(r"PMI\D{0,25}(\d{2,3}(?:\.\d+)?)", title, re.IGNORECASE))
+    m = _best(matches)
     if m:
         return float(m.group(1)), None
     return None, None
@@ -373,6 +398,15 @@ def _fetch_pmi_candidates(query):
     return reputable, fallback
 
 
+# A PMI reading this far outside the normal range is essentially always a
+# misparse (grabbed a year, a percentage change, an unrelated stat, etc.)
+# rather than a real reading — modern PMI prints basically never go below
+# ~25 or above ~75 even in extreme conditions (e.g. China's manufacturing
+# PMI bottomed near 35 in Feb 2020). Used as a last-resort sanity check, not
+# a substitute for correct parsing.
+PMI_VALID_RANGE = (20.0, 80.0)
+
+
 @st.cache_data(ttl=CACHE_TTL)
 def fetch_pmi_data():
     """For each (country, PMI type), try each configured query variant in
@@ -383,7 +417,13 @@ def fetch_pmi_data():
     turns up anywhere, we fall back to the single best headline we found so
     the person can still click through and read the number at the source.
     Re-run every cache cycle, so a fresh release shows up automatically as
-    soon as a reputable outlet reports it."""
+    soon as a reputable outlet reports it.
+
+    Accuracy safeguards: a number is only ever extracted from a REPUTABLE
+    outlet's headline — never from an unvetted aggregator — and any parsed
+    value outside PMI_VALID_RANGE is treated as a failed parse rather than
+    displayed, since a number that far off is far more likely a misparse
+    than a real reading."""
     results = {}
     for (country, kind), variants in PMI_QUERY_VARIANTS.items():
         results.setdefault(country, {})
@@ -392,12 +432,15 @@ def fetch_pmi_data():
         try:
             for query in variants:
                 reputable, fallback = _fetch_pmi_candidates(query)
-                candidates = (reputable or fallback)[:PMI_CANDIDATES_TO_SCAN]
-                if candidates and best_fallback_item is None:
-                    best_fallback_item = candidates[0]
-                for item in candidates:
+                # Headline display (incl. fallback for the "no parse" case)
+                # can use any source; but a NUMBER is only ever trusted from
+                # a reputable one.
+                display_candidates = (reputable or fallback)[:PMI_CANDIDATES_TO_SCAN]
+                if display_candidates and best_fallback_item is None:
+                    best_fallback_item = display_candidates[0]
+                for item in reputable[:PMI_CANDIDATES_TO_SCAN]:
                     value, prev = _parse_pmi_value(item["title"], keyword=kind)
-                    if value is not None:
+                    if value is not None and PMI_VALID_RANGE[0] <= value <= PMI_VALID_RANGE[1]:
                         parsed_item = {**item, "value": value, "prev": prev}
                         break
                 if parsed_item:
@@ -420,14 +463,21 @@ def _parse_rate_value(title):
     an unemployment-rate headline, e.g.:
       "US unemployment rate rises to 4.2% in June from 4.0% in May" -> (4.2, 4.0)
       "China's jobless rate holds at 5.0%"                          -> (5.0, None)
+      "India unemployment rate eases to 7.1 in June"                -> (7.1, None)
     """
     m = re.search(
-        r"(\d{1,2}(?:\.\d+)?)\s*%[^.\n]{0,45}?\bfrom\b\s*(\d{1,2}(?:\.\d+)?)",
+        r"(\d{1,2}(?:\.\d+)?)\s*%?[^.\n]{0,45}?\bfrom\b\s*(\d{1,2}(?:\.\d+)?)",
         title, re.IGNORECASE,
     )
     if m:
         return float(m.group(1)), float(m.group(2))
     m = re.search(r"(\d{1,2}(?:\.\d+)?)\s*%", title)
+    if m:
+        return float(m.group(1)), None
+    # Pattern 3: "unemployment/jobless rate ... <number>" without a percent
+    # sign, e.g. "India's unemployment rate at 7.1 in June" (Indian outlets
+    # often quote the CMIE/PLFS figure this way).
+    m = re.search(r"(?:unemployment|jobless)\D{0,25}rate\D{0,15}(\d{1,2}(?:\.\d+)?)\b", title, re.IGNORECASE)
     if m:
         return float(m.group(1)), None
     return None, None
@@ -475,31 +525,145 @@ def _fetch_employment_candidates(query, window):
     return reputable, fallback
 
 
+# A parsed unemployment rate or payrolls change this far outside plausible
+# territory is essentially always a misparse (grabbed a year, an unrelated
+# percentage, a different country's figure, etc.) rather than a real
+# reading. Used as a last-resort sanity check, not a substitute for correct
+# parsing. Rate bound is generous (covers even COVID-era spikes to ~15-25%
+# in some economies); payrolls bound covers the largest one-month swings on
+# record (US lost ~20M jobs in Apr 2020, gained ~4.8M in Jun 2020).
+RATE_VALID_RANGE = (0.0, 30.0)
+PAYROLL_VALID_RANGE = (-25_000_000, 6_000_000)
+
+# --- Official-source path for US metrics (FRED / Bureau of Labor Statistics) ---
+# Headline-parsing is inherently best-effort — narrative news wording varies
+# too much to guarantee an accurate extraction every time. For the US,
+# there's a genuinely free, official, no-scraping alternative: the Federal
+# Reserve's FRED API serves the real BLS data directly as a numeric time
+# series, so we use that instead whenever a (free) FRED API key is
+# configured. UNRATE and PAYEMS are both long-standing, stable FRED series
+# IDs (unemployment rate and total nonfarm payroll employment level,
+# respectively) that have been unchanged for decades.
+#
+# To enable this, get a free key at https://fred.stlouisfed.org/docs/api/api_key.html
+# and add it to your Streamlit secrets as:
+#   FRED_API_KEY = "your-key-here"
+# Without a key configured, the US tiles simply fall back to the same
+# headline-parsing approach used for China/India/Singapore (no error, no
+# broken behavior — just less authoritative).
+FRED_SERIES_IDS = {
+    ("United States", "Unemployment Rate"): "UNRATE",
+    ("United States", "Non-Farm Payrolls"): "PAYEMS",
+}
+
+
+def _get_fred_api_key():
+    try:
+        return st.secrets.get("FRED_API_KEY")
+    except Exception:
+        return None
+
+
+def _fetch_fred_observations(series_id, api_key, limit=2):
+    import json
+    import urllib.parse
+    import urllib.request
+    url = "https://api.stlouisfed.org/fred/series/observations?" + urllib.parse.urlencode({
+        "series_id": series_id, "api_key": api_key, "file_type": "json",
+        "sort_order": "desc", "limit": limit,
+    })
+    with urllib.request.urlopen(url, timeout=8) as resp:
+        data = json.loads(resp.read().decode())
+    return [o for o in data.get("observations", []) if o.get("value") not in (None, ".")]
+
+
+def _fetch_fred_item(country, metric, cfg):
+    """Try fetching this metric directly from FRED instead of parsing a news
+    headline. Returns None (caller falls back to headline-scraping) if no
+    series is mapped for this (country, metric), no API key is configured,
+    or the request fails for any reason — this must never raise."""
+    series_id = FRED_SERIES_IDS.get((country, metric))
+    api_key = _get_fred_api_key()
+    if not series_id or not api_key:
+        return None
+    try:
+        obs = _fetch_fred_observations(series_id, api_key, limit=2)
+        if not obs:
+            return None
+        latest = float(obs[0]["value"])
+        prev = float(obs[1]["value"]) if len(obs) > 1 else None
+        link = f"https://fred.stlouisfed.org/series/{series_id}"
+        source = "FRED (U.S. Bureau of Labor Statistics)"
+        if cfg["kind"] == "rate":
+            return {"value": latest, "prev": prev, "kind": "rate", "title": "",
+                    "link": link, "source": source, "published": obs[0]["date"]}
+        # payrolls: FRED gives the employment LEVEL in thousands; report the
+        # month-over-month CHANGE in jobs, which is the conventional way
+        # Non-Farm Payrolls is quoted.
+        if prev is None:
+            return None
+        change = (latest - prev) * 1000
+        return {"value": change, "prev": None, "kind": "payrolls", "title": "",
+                "link": link, "source": source, "published": obs[0]["date"]}
+    except Exception:
+        return None
+
+
 @st.cache_data(ttl=CACHE_TTL)
 def fetch_employment_data():
-    """For each (country, metric), try each configured query variant in turn
-    and scan several headlines for one whose wording we can parse a figure
-    out of — same approach as fetch_pmi_data. Falls back to the best headline
-    found (with a source link) if nothing parses cleanly. Re-run every cache
-    cycle, so a fresh release shows up automatically as soon as a reputable
-    outlet reports it."""
+    """For each (country, metric): for US metrics, try FRED's official data
+    first (see _fetch_fred_item). Otherwise — and as a fallback if FRED
+    isn't configured — try each configured news-query variant in turn and
+    scan several headlines for one whose wording we can parse a figure out
+    of, same approach as fetch_pmi_data. Falls back to the best headline
+    found (with a source link) if nothing parses cleanly. Re-run every
+    cache cycle, so a fresh release shows up automatically as soon as it's
+    available.
+
+    Accuracy safeguards on the headline-parsing path: a number is only ever
+    extracted from a REPUTABLE outlet's headline; headlines about a
+    different, more volatile sub-metric (youth/graduate unemployment) are
+    excluded so they can't get misread as the general rate; and any parsed
+    value outside the sanity ranges above is treated as a failed parse
+    rather than displayed."""
     results = {}
     for (country, metric), cfg in EMPLOYMENT_METRICS.items():
         results.setdefault(country, {})
+
+        fred_item = _fetch_fred_item(country, metric, cfg)
+        if fred_item:
+            results[country][metric] = fred_item
+            continue
+
         best_fallback_item = None
         parsed_item = None
         try:
             for query in cfg["variants"]:
                 reputable, fallback = _fetch_employment_candidates(query, cfg["window"])
-                candidates = (reputable or fallback)[:EMPLOYMENT_CANDIDATES_TO_SCAN]
-                if candidates and best_fallback_item is None:
-                    best_fallback_item = candidates[0]
-                for item in candidates:
+                display_candidates = (reputable or fallback)[:EMPLOYMENT_CANDIDATES_TO_SCAN]
+                parse_candidates = reputable[:EMPLOYMENT_CANDIDATES_TO_SCAN]
+                if cfg["kind"] == "rate":
+                    # Drop headlines about a different, more volatile
+                    # sub-metric (youth/graduate unemployment) that would
+                    # otherwise get misread as the general rate.
+                    display_candidates = [
+                        c for c in display_candidates
+                        if not any(term in c["title"].lower() for term in EMPLOYMENT_RATE_EXCLUDE_TERMS)
+                    ]
+                    parse_candidates = [
+                        c for c in parse_candidates
+                        if not any(term in c["title"].lower() for term in EMPLOYMENT_RATE_EXCLUDE_TERMS)
+                    ]
+                if display_candidates and best_fallback_item is None:
+                    best_fallback_item = display_candidates[0]
+                for item in parse_candidates:
                     if cfg["kind"] == "rate":
                         value, prev = _parse_rate_value(item["title"])
+                        valid = value is not None and RATE_VALID_RANGE[0] <= value <= RATE_VALID_RANGE[1]
                     else:
                         value, prev = _parse_payroll_value(item["title"]), None
-                    if value is not None:
+                        valid = value is not None and PAYROLL_VALID_RANGE[0] <= value <= PAYROLL_VALID_RANGE[1]
+                    if valid:
                         parsed_item = {**item, "value": value, "prev": prev}
                         break
                 if parsed_item:
@@ -723,13 +887,14 @@ for i, row in enumerate(fetch_currency_data()):
 
 st.markdown("##### 🏭 Manufacturing & Services PMI")
 st.caption(
-    "A reading above 50 signals expansion, below 50 signals contraction. PMI is only "
-    "released once a month per country, so unlike the market prices above, a tile only "
-    "changes when a new report actually comes out — but this pulls the latest reputable-"
-    "outlet headline for each release live, every refresh, so a new print appears here as "
-    "soon as it's reported (no manual updates). Sources: ISM (US), National Bureau of "
-    "Statistics of China, S&P Global (India; Singapore services/whole-economy), and SIPMM "
-    "(Singapore manufacturing)."
+    "A reading above 50 signals expansion, below 50 signals contraction. There's no free "
+    "real-time official API for PMI (ISM/S&P Global/NBS license the raw data commercially), "
+    "so this pulls the latest *reputable-outlet* headline reporting each release, live, every "
+    "refresh — a number is never extracted from an unvetted source, and never displayed if it "
+    "falls outside a plausible PMI range, so a misparse shows as 'no data' rather than a wrong "
+    "figure. PMI is only released once a month per country, so a tile only changes when a new "
+    "report actually comes out. Sources: ISM (US), National Bureau of Statistics of China, "
+    "S&P Global (India; Singapore services/whole-economy), and SIPMM (Singapore manufacturing)."
 )
 _render_pmi(fetch_pmi_data())
 
@@ -737,11 +902,16 @@ st.markdown("##### 👷 Unemployment & Non-Farm Payrolls")
 st.caption(
     "Unemployment rate for the US, China, India and Singapore, plus US Non-Farm "
     "Payrolls (the US doesn't have a direct equivalent published for the other "
-    "three markets). These are only released monthly (quarterly for Singapore's "
-    "MOM labour market report), so a tile only changes when a new report actually "
-    "comes out — but this pulls the latest reputable-outlet headline for each "
-    "release live, every refresh, so a new print appears here as soon as it's "
-    "reported (no manual updates). Sources: U.S. Bureau of Labor Statistics (BLS), "
+    "three markets). US figures pull directly from FRED — the Federal Reserve's "
+    "official data API serving real Bureau of Labor Statistics numbers — when a "
+    "free FRED API key is configured (see the code comment near FRED_SERIES_IDS); "
+    "otherwise, and always for China/India/Singapore (no free real-time official "
+    "API exists for these), figures are parsed from the latest *reputable-outlet* "
+    "headline reporting each release, live, every refresh — never from an unvetted "
+    "source, and never displayed if the extracted number falls outside a plausible "
+    "range for that metric. These are only released monthly (quarterly for "
+    "Singapore's MOM labour market report), so a tile only changes when a new "
+    "report actually comes out. Sources: U.S. Bureau of Labor Statistics (BLS), "
     "National Bureau of Statistics of China, MoSPI/CMIE (India), and Ministry of "
     "Manpower (Singapore)."
 )
