@@ -105,24 +105,32 @@ TOP_STOCKS_UNIVERSE = {
 # as soon as a reputable outlet reports it — no manual updates needed. If a
 # headline's wording can't be parsed into a number, we still surface the
 # headline itself (with a link back to the source) rather than guessing.
-# `when:35d` keeps the search window wide enough to span a monthly release
-# cycle even if a source is a few days late reporting it.
+#
+# Each entry below is a *list* of plain search-term variants (no boolean
+# operators/parentheses — Google News RSS handles those inconsistently) tried
+# in order; we also scan several matching headlines per variant, since a
+# narrative-style headline (e.g. "China's factory activity expands for a
+# third month") often omits the actual number even when it's a perfectly good
+# reputable source, while a data-provider press release usually states it
+# plainly (e.g. "Manufacturing PMI at 53.3%"). `when:35d` keeps the window
+# wide enough to span a monthly release cycle even if a source reports late.
 # Primary reputable compilers behind each series:
 #   - United States: Institute for Supply Management (ISM)
 #   - China:         National Bureau of Statistics of China (NBS, official)
-#   - India:         S&P Global
+#   - India:         S&P Global (branded "HSBC India PMI" in most headlines)
 #   - Singapore:     SIPMM for manufacturing; S&P Global for services/whole-economy
 #                    (Singapore has no separate dedicated services PMI of its own)
-PMI_FEEDS = {
-    ("United States", "Manufacturing"): "https://news.google.com/rss/search?q=%22ISM+Manufacturing+PMI%22+when:35d&hl=en-US&gl=US&ceid=US:en",
-    ("United States", "Services"):      "https://news.google.com/rss/search?q=%22ISM+Services+PMI%22+when:35d&hl=en-US&gl=US&ceid=US:en",
-    ("China", "Manufacturing"):         "https://news.google.com/rss/search?q=China+manufacturing+PMI+when:35d&hl=en-US&gl=US&ceid=US:en",
-    ("China", "Services"):              "https://news.google.com/rss/search?q=(China+non-manufacturing+PMI+OR+China+services+PMI)+when:35d&hl=en-US&gl=US&ceid=US:en",
-    ("India", "Manufacturing"):         "https://news.google.com/rss/search?q=(India+Manufacturing+PMI+OR+HSBC+India+Manufacturing+PMI)+when:35d&hl=en-US&gl=US&ceid=US:en",
-    ("India", "Services"):              "https://news.google.com/rss/search?q=(India+Services+PMI+OR+HSBC+India+Services+PMI)+when:35d&hl=en-US&gl=US&ceid=US:en",
-    ("Singapore", "Manufacturing"):     "https://news.google.com/rss/search?q=Singapore+Manufacturing+PMI+SIPMM+when:35d&hl=en-US&gl=US&ceid=US:en",
-    ("Singapore", "Services"):          "https://news.google.com/rss/search?q=(Singapore+PMI+S%26P+Global+OR+Singapore+private+sector+PMI)+when:35d&hl=en-US&gl=US&ceid=US:en",
+PMI_QUERY_VARIANTS = {
+    ("United States", "Manufacturing"): ['"ISM Manufacturing PMI"'],
+    ("United States", "Services"):      ['"ISM Services PMI"'],
+    ("China", "Manufacturing"):         ["China manufacturing PMI", "China factory activity PMI NBS"],
+    ("China", "Services"):              ["China non-manufacturing PMI", "China services PMI NBS"],
+    ("India", "Manufacturing"):         ["HSBC India Manufacturing PMI", "India Manufacturing PMI S&P Global"],
+    ("India", "Services"):              ["HSBC India Services PMI", "India Services PMI S&P Global"],
+    ("Singapore", "Manufacturing"):     ["Singapore Manufacturing PMI SIPMM"],
+    ("Singapore", "Services"):          ["Singapore PMI S&P Global", "Singapore private sector PMI"],
 }
+PMI_CANDIDATES_TO_SCAN = 6  # how many headlines per query variant to check for a parseable number
 
 TOP_PERFORMERS_COUNT = 10  # how many top gainers to show per market
 
@@ -280,53 +288,59 @@ def _parse_pmi_value(title):
     return None, None
 
 
+def _pmi_news_query_url(query, window="35d"):
+    return (f"https://news.google.com/rss/search?q={quote_plus(query)}"
+            f"+when:{window}&hl=en-US&gl=US&ceid=US:en")
+
+
+def _fetch_pmi_candidates(query):
+    """Fetch one query's headlines, split into reputable vs. other, each
+    already cleaned up via _build_item."""
+    feed = feedparser.parse(_pmi_news_query_url(query))
+    reputable, fallback = [], []
+    for e in feed.entries:
+        source = _source_name(e)
+        item = _build_item(e, source)
+        (reputable if _is_reputable(source) else fallback).append(item)
+    return reputable, fallback
+
+
 @st.cache_data(ttl=CACHE_TTL)
 def fetch_pmi_data():
-    """For each (country, PMI type), pull the latest reputable-outlet headline
-    reporting that release from Google News RSS and try to parse the reading
-    out of it. Re-run every cache cycle, so a fresh release shows up here as
+    """For each (country, PMI type), try each configured query variant in
+    turn and scan several of the resulting headlines for one whose wording
+    we can actually parse a PMI value out of (see _parse_pmi_value) — many
+    perfectly reputable headlines are narrative-only and never state the
+    figure, so just taking entry #1 isn't reliable. If nothing parseable
+    turns up anywhere, we fall back to the single best headline we found so
+    the person can still click through and read the number at the source.
+    Re-run every cache cycle, so a fresh release shows up automatically as
     soon as a reputable outlet reports it."""
     results = {}
-    for (country, kind), url in PMI_FEEDS.items():
+    for (country, kind), variants in PMI_QUERY_VARIANTS.items():
         results.setdefault(country, {})
+        best_fallback_item = None
+        parsed_item = None
         try:
-            feed = feedparser.parse(url)
-            reputable, fallback = [], []
-            for e in feed.entries:
-                source = _source_name(e)
-                item = _build_item(e, source)
-                (reputable if _is_reputable(source) else fallback).append(item)
-            chosen = reputable or fallback
+            for query in variants:
+                reputable, fallback = _fetch_pmi_candidates(query)
+                candidates = (reputable or fallback)[:PMI_CANDIDATES_TO_SCAN]
+                if candidates and best_fallback_item is None:
+                    best_fallback_item = candidates[0]
+                for item in candidates:
+                    value, prev = _parse_pmi_value(item["title"])
+                    if value is not None:
+                        parsed_item = {**item, "value": value, "prev": prev}
+                        break
+                if parsed_item:
+                    break
 
-            # If our (deliberately specific) query above matched nothing at
-            # all, retry once with a plain, generic query before giving up —
-            # this keeps a country/type from silently going blank just
-            # because outlets phrased a headline differently than expected.
-            if not chosen:
-                generic_q = quote_plus(f"{country} {kind} PMI")
-                generic_url = (f"https://news.google.com/rss/search?q={generic_q}"
-                               f"+when:35d&hl=en-US&gl=US&ceid=US:en")
-                feed = feedparser.parse(generic_url)
-                reputable, fallback = [], []
-                for e in feed.entries:
-                    source = _source_name(e)
-                    item = _build_item(e, source)
-                    (reputable if _is_reputable(source) else fallback).append(item)
-                chosen = reputable or fallback
-
-            if not chosen:
+            if parsed_item:
+                results[country][kind] = parsed_item
+            elif best_fallback_item:
+                results[country][kind] = {**best_fallback_item, "value": None, "prev": None}
+            else:
                 results[country][kind] = None
-                continue
-            item = chosen[0]
-            value, prev = _parse_pmi_value(item["title"])
-            results[country][kind] = {
-                "title": item["title"],
-                "link": item["link"],
-                "source": item["source"],
-                "published": item["published"],
-                "value": value,
-                "prev": prev,
-            }
         except Exception as e:
             results[country][kind] = {"title": f"Error: {e}", "link": "", "source": "",
                                        "published": "", "value": None, "prev": None}
@@ -448,7 +462,7 @@ def _render_pmi(pmi_data):
     the latest headline we show it as a metric with month-over-month delta,
     otherwise we fall back to showing the headline itself with a source link
     so the person can read the actual figure at the source."""
-    countries = list(PMI_FEEDS.keys())
+    countries = list(PMI_QUERY_VARIANTS.keys())
     country_names = list(dict.fromkeys(c for c, _ in countries))  # stable order, de-duped
     country_cols = st.columns(len(country_names))
     for col, country in zip(country_cols, country_names):
