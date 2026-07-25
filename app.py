@@ -126,11 +126,58 @@ PMI_QUERY_VARIANTS = {
     ("China", "Manufacturing"):         ["China manufacturing PMI", "China factory activity PMI NBS"],
     ("China", "Services"):              ["China non-manufacturing PMI", "China services PMI NBS"],
     ("India", "Manufacturing"):         ["HSBC India Manufacturing PMI", "India Manufacturing PMI S&P Global"],
-    ("India", "Services"):              ["HSBC India Services PMI", "India Services PMI S&P Global"],
+    ("India", "Services"):              [
+        "HSBC India Services PMI", "India Services PMI S&P Global",
+        "India services PMI", "India services activity PMI",
+    ],
     ("Singapore", "Manufacturing"):     ["Singapore Manufacturing PMI SIPMM"],
     ("Singapore", "Services"):          ["Singapore PMI S&P Global", "Singapore private sector PMI"],
 }
-PMI_CANDIDATES_TO_SCAN = 6  # how many headlines per query variant to check for a parseable number
+PMI_CANDIDATES_TO_SCAN = 8  # how many headlines per query variant to check for a parseable number
+
+# Unemployment rate & (US) Non-Farm Payrolls, same live-headline approach as
+# PMI above: there's no free real-time numeric API for these either, so we
+# poll Google News RSS for the latest reputable-outlet headline reporting
+# each release and parse the figure out of it. Re-fetched every cache cycle,
+# so a new print appears automatically as soon as a reputable outlet reports
+# it. "Non-Farm Payrolls" is a US-specific report (from the same monthly BLS
+# jobs release as the unemployment rate) — China, India, and Singapore don't
+# publish an equivalent payrolls figure, so only their unemployment rate is
+# tracked. `window` is widened for Singapore since MOM only reports labour
+# market data quarterly, not monthly.
+# Primary reputable compilers behind each series:
+#   - United States: Bureau of Labor Statistics (BLS)
+#   - China:         National Bureau of Statistics of China (NBS) — surveyed urban unemployment rate
+#   - India:         Ministry of Statistics & Programme Implementation (MoSPI) / CMIE
+#   - Singapore:     Ministry of Manpower (MOM)
+EMPLOYMENT_METRICS = {
+    ("United States", "Unemployment Rate"): {
+        "kind": "rate",
+        "window": "35d",
+        "variants": ['"unemployment rate" BLS jobs report', "US unemployment rate"],
+    },
+    ("United States", "Non-Farm Payrolls"): {
+        "kind": "payrolls",
+        "window": "35d",
+        "variants": ['"nonfarm payrolls" BLS', "US jobs report payrolls added"],
+    },
+    ("China", "Unemployment Rate"): {
+        "kind": "rate",
+        "window": "35d",
+        "variants": ["China surveyed urban unemployment rate NBS", "China unemployment rate"],
+    },
+    ("India", "Unemployment Rate"): {
+        "kind": "rate",
+        "window": "35d",
+        "variants": ["India unemployment rate CMIE", "India unemployment rate MoSPI"],
+    },
+    ("Singapore", "Unemployment Rate"): {
+        "kind": "rate",
+        "window": "100d",
+        "variants": ["Singapore unemployment rate MOM", "Singapore unemployment rate Ministry of Manpower"],
+    },
+}
+EMPLOYMENT_CANDIDATES_TO_SCAN = 6  # how many headlines per query variant to check for a parseable number
 
 TOP_PERFORMERS_COUNT = 10  # how many top gainers to show per market
 
@@ -262,33 +309,54 @@ def _build_item(entry, source):
     }
 
 
-def _parse_pmi_value(title):
+def _parse_pmi_value(title, keyword=None):
     """Best-effort extraction of (value, previous_value) from a PMI headline.
     Returns (value, prev) with either possibly None if not confidently parsed.
     Handles the common financial-news phrasings, e.g.:
       "...PMI rose to 51.3 in June 2026 from 51.0 in May"   -> (51.3, 51.0)
       "...PMI eased to 54.2 in June from 55.0 in May"       -> (54.2, 55.0)
       "Manufacturing PMI at 53.3%; June 2026 ISM Report"    -> (53.3, None)
+
+    `keyword` (e.g. "services" or "manufacturing") disambiguates headlines
+    that report BOTH figures at once, e.g. "India factory PMI at 58.4 as
+    services PMI eases to 60.5" — without this, the manufacturing figure
+    would be picked up first and wrongly attributed to services (or vice
+    versa). When both PMI-type words appear in the title, we first narrow
+    the search to the text around `keyword` before falling back to the
+    whole title.
     """
+    search_text = title
+    if keyword:
+        other_terms = {"manufacturing", "services", "non-manufacturing"} - {keyword.lower()}
+        km = re.search(re.escape(keyword), title, re.IGNORECASE)
+        mentions_other = any(re.search(re.escape(t), title, re.IGNORECASE) for t in other_terms)
+        if km and mentions_other:
+            # Scope to a window around the keyword so the "other" type's
+            # number (which may appear earlier/later in the same headline)
+            # isn't picked up instead.
+            start = max(0, km.start() - 15)
+            end = km.end() + 60
+            search_text = title[start:end]
+
     # Pattern 1: two numbers linked by "... from ..." (gives current + prior)
     m = re.search(
         r"(\d{2,3}(?:\.\d+)?)\s*%?[^.\n]{0,45}?\bfrom\b\s*(\d{2,3}(?:\.\d+)?)",
-        title, re.IGNORECASE,
+        search_text, re.IGNORECASE,
     )
     if m:
         return float(m.group(1)), float(m.group(2))
     # Pattern 2: a single "NN.N%" figure
-    m = re.search(r"(\d{2,3}(?:\.\d+)?)\s*%", title)
+    m = re.search(r"(\d{2,3}(?:\.\d+)?)\s*%", search_text)
     if m:
         return float(m.group(1)), None
     # Pattern 3: "PMI ... <number>" without a percent sign
-    m = re.search(r"PMI\D{0,15}(\d{2,3}(?:\.\d+)?)", title, re.IGNORECASE)
+    m = re.search(r"PMI\D{0,15}(\d{2,3}(?:\.\d+)?)", search_text, re.IGNORECASE)
     if m:
         return float(m.group(1)), None
     return None, None
 
 
-def _pmi_news_query_url(query, window="35d"):
+def _pmi_news_query_url(query, window="45d"):
     return (f"https://news.google.com/rss/search?q={quote_plus(query)}"
             f"+when:{window}&hl=en-US&gl=US&ceid=US:en")
 
@@ -328,7 +396,7 @@ def fetch_pmi_data():
                 if candidates and best_fallback_item is None:
                     best_fallback_item = candidates[0]
                 for item in candidates:
-                    value, prev = _parse_pmi_value(item["title"])
+                    value, prev = _parse_pmi_value(item["title"], keyword=kind)
                     if value is not None:
                         parsed_item = {**item, "value": value, "prev": prev}
                         break
@@ -344,6 +412,108 @@ def fetch_pmi_data():
         except Exception as e:
             results[country][kind] = {"title": f"Error: {e}", "link": "", "source": "",
                                        "published": "", "value": None, "prev": None}
+    return results
+
+
+def _parse_rate_value(title):
+    """Best-effort extraction of (value, previous_value) percent figures from
+    an unemployment-rate headline, e.g.:
+      "US unemployment rate rises to 4.2% in June from 4.0% in May" -> (4.2, 4.0)
+      "China's jobless rate holds at 5.0%"                          -> (5.0, None)
+    """
+    m = re.search(
+        r"(\d{1,2}(?:\.\d+)?)\s*%[^.\n]{0,45}?\bfrom\b\s*(\d{1,2}(?:\.\d+)?)",
+        title, re.IGNORECASE,
+    )
+    if m:
+        return float(m.group(1)), float(m.group(2))
+    m = re.search(r"(\d{1,2}(?:\.\d+)?)\s*%", title)
+    if m:
+        return float(m.group(1)), None
+    return None, None
+
+
+def _parse_payroll_value(title):
+    """Best-effort extraction of the monthly change in US Non-Farm Payrolls
+    (in jobs added/lost) from a headline, e.g.:
+      "US adds 147,000 jobs in June, payrolls beat forecasts" -> 147000.0
+      "Nonfarm payrolls rose by 150K in May"                  -> 150000.0
+      "US economy sheds 20,000 jobs"                          -> -20000.0
+    """
+    lost = bool(re.search(r"\b(sheds|lost|fell|drop(?:s|ped)?|declin\w*)\b", title, re.IGNORECASE))
+    m = re.search(r"([\d]{1,3}(?:,\d{3})+)\s*(?:jobs|payrolls)", title, re.IGNORECASE)
+    if not m:
+        m = re.search(
+            r"(?:added|adds|gained|gains|rose(?:\s+by)?|rises(?:\s+by)?|increased(?:\s+by)?|"
+            r"up(?:\s+by)?|fell(?:\s+by)?|drops?(?:\s+by)?|lost|sheds)\s+"
+            r"([\d]{1,3}(?:,\d{3})+|\d+K)\b",
+            title, re.IGNORECASE,
+        )
+    if not m:
+        m = re.search(r"payrolls?\D{0,20}?([\d]{1,3}(?:,\d{3})+|\d+K)\b", title, re.IGNORECASE)
+    if not m:
+        return None
+    raw = m.group(1).replace(",", "")
+    value = float(raw[:-1]) * 1000 if raw.upper().endswith("K") else float(raw)
+    return -value if lost else value
+
+
+def _employment_news_query_url(query, window):
+    return (f"https://news.google.com/rss/search?q={quote_plus(query)}"
+            f"+when:{window}&hl=en-US&gl=US&ceid=US:en")
+
+
+def _fetch_employment_candidates(query, window):
+    """Fetch one query's headlines, split into reputable vs. other, each
+    already cleaned up via _build_item."""
+    feed = feedparser.parse(_employment_news_query_url(query, window))
+    reputable, fallback = [], []
+    for e in feed.entries:
+        source = _source_name(e)
+        item = _build_item(e, source)
+        (reputable if _is_reputable(source) else fallback).append(item)
+    return reputable, fallback
+
+
+@st.cache_data(ttl=CACHE_TTL)
+def fetch_employment_data():
+    """For each (country, metric), try each configured query variant in turn
+    and scan several headlines for one whose wording we can parse a figure
+    out of — same approach as fetch_pmi_data. Falls back to the best headline
+    found (with a source link) if nothing parses cleanly. Re-run every cache
+    cycle, so a fresh release shows up automatically as soon as a reputable
+    outlet reports it."""
+    results = {}
+    for (country, metric), cfg in EMPLOYMENT_METRICS.items():
+        results.setdefault(country, {})
+        best_fallback_item = None
+        parsed_item = None
+        try:
+            for query in cfg["variants"]:
+                reputable, fallback = _fetch_employment_candidates(query, cfg["window"])
+                candidates = (reputable or fallback)[:EMPLOYMENT_CANDIDATES_TO_SCAN]
+                if candidates and best_fallback_item is None:
+                    best_fallback_item = candidates[0]
+                for item in candidates:
+                    if cfg["kind"] == "rate":
+                        value, prev = _parse_rate_value(item["title"])
+                    else:
+                        value, prev = _parse_payroll_value(item["title"]), None
+                    if value is not None:
+                        parsed_item = {**item, "value": value, "prev": prev}
+                        break
+                if parsed_item:
+                    break
+
+            if parsed_item:
+                results[country][metric] = {**parsed_item, "kind": cfg["kind"]}
+            elif best_fallback_item:
+                results[country][metric] = {**best_fallback_item, "value": None, "prev": None, "kind": cfg["kind"]}
+            else:
+                results[country][metric] = None
+        except Exception as e:
+            results[country][metric] = {"title": f"Error: {e}", "link": "", "source": "",
+                                         "published": "", "value": None, "prev": None, "kind": cfg["kind"]}
     return results
 
 
@@ -487,6 +657,38 @@ def _render_pmi(pmi_data):
                     st.caption(item["title"])
 
 
+def _render_employment(employment_data):
+    """Render unemployment rate (all 4 markets) & US Non-Farm Payrolls,
+    grouped by country. Each reading is live-fetched (see
+    fetch_employment_data); if we could parse a figure out of the latest
+    headline we show it as a metric with month-over-month delta where
+    available, otherwise we fall back to showing the headline itself with a
+    source link so the person can read the actual figure at the source."""
+    country_names = list(dict.fromkeys(c for c, _ in EMPLOYMENT_METRICS.keys()))
+    country_cols = st.columns(len(country_names))
+    for col, country in zip(country_cols, country_names):
+        with col:
+            st.markdown(f"**{country}**")
+            metrics_for_country = [m for c, m in EMPLOYMENT_METRICS.keys() if c == country]
+            for metric in metrics_for_country:
+                item = employment_data.get(country, {}).get(metric)
+                if not item:
+                    st.caption(f"{metric}: _no data available right now._")
+                    continue
+                if item["value"] is not None:
+                    if item["kind"] == "rate":
+                        delta = f"{item['value'] - item['prev']:+.1f}" if item["prev"] is not None else None
+                        st.metric(metric, f"{item['value']:.1f}%", delta)
+                    else:  # payrolls, in jobs added/lost
+                        st.metric(metric, f"{item['value']:+,.0f} jobs")
+                else:
+                    st.markdown(f"**{metric}**")
+                if item["link"]:
+                    st.caption(f"[{item['source'] or 'source'}]({item['link']}) · {item['published']}")
+                else:
+                    st.caption(item["title"])
+
+
 # ---------------------------------------------------------------------------
 # UI
 # ---------------------------------------------------------------------------
@@ -530,6 +732,20 @@ st.caption(
     "(Singapore manufacturing)."
 )
 _render_pmi(fetch_pmi_data())
+
+st.markdown("##### 👷 Unemployment & Non-Farm Payrolls")
+st.caption(
+    "Unemployment rate for the US, China, India and Singapore, plus US Non-Farm "
+    "Payrolls (the US doesn't have a direct equivalent published for the other "
+    "three markets). These are only released monthly (quarterly for Singapore's "
+    "MOM labour market report), so a tile only changes when a new report actually "
+    "comes out — but this pulls the latest reputable-outlet headline for each "
+    "release live, every refresh, so a new print appears here as soon as it's "
+    "reported (no manual updates). Sources: U.S. Bureau of Labor Statistics (BLS), "
+    "National Bureau of Statistics of China, MoSPI/CMIE (India), and Ministry of "
+    "Manpower (Singapore)."
+)
+_render_employment(fetch_employment_data())
 
 st.subheader("📰 Live Market News — SG, US, China, India")
 st.caption(f"Prioritizes reputable outlets (Reuters, Bloomberg, CNBC, FT, WSJ, AP, BBC, and similar); "
@@ -598,6 +814,7 @@ for tab, (market, data) in zip(loser_tabs, top_performers.items()):
 
 st.caption(
     "Data sources: Yahoo Finance (indices/currencies/VIX/yields/top performers), Google News RSS "
-    "(headlines and PMI readings, prioritizing reputable outlets — ISM, NBS China, S&P Global, SIPMM). "
-    "This is informational only, not financial advice."
+    "(headlines, PMI, and unemployment/payrolls readings, prioritizing reputable outlets — ISM, NBS "
+    "China, S&P Global, SIPMM, BLS, MoSPI/CMIE, MOM Singapore). This is informational only, not "
+    "financial advice."
 )
