@@ -131,7 +131,10 @@ PMI_QUERY_VARIANTS = {
         "India services PMI", "India services activity PMI",
     ],
     ("Singapore", "Manufacturing"):     ["Singapore Manufacturing PMI SIPMM"],
-    ("Singapore", "Services"):          ["Singapore PMI S&P Global", "Singapore private sector PMI"],
+    ("Singapore", "Services"):          [
+        "Singapore PMI S&P Global", "Singapore private sector PMI",
+        "Singapore services PMI", "Singapore whole economy PMI",
+    ],
 }
 PMI_CANDIDATES_TO_SCAN = 8  # how many headlines per query variant to check for a parseable number
 
@@ -228,6 +231,11 @@ REPUTABLE_SOURCES = [
     "The Straits Times", "Channel News Asia", "CNA", "The Business Times",
     "MarketWatch", "Barron's", "The Economist", "Forbes", "Nikkei Asia",
     "South China Morning Post", "The Economic Times", "Livemint",
+    # Official newswires that data publishers (ISM, BLS, etc.) use to
+    # distribute their own primary-source press releases — these are the
+    # release itself, not secondhand commentary, so they belong here even
+    # though they're wire services rather than editorial outlets.
+    "PR Newswire", "Business Wire", "GlobeNewswire",
 ]
 
 
@@ -406,6 +414,24 @@ def _fetch_pmi_candidates(query):
 # a substitute for correct parsing.
 PMI_VALID_RANGE = (20.0, 80.0)
 
+# Terms that confirm a headline is actually ABOUT the given PMI type. A
+# query like "China non-manufacturing PMI" can still return a headline
+# that's really about manufacturing (Google News' matching isn't strict
+# phrase-only), and when that headline only states one number, keyword-
+# proximity disambiguation can't help — there's nothing to disambiguate
+# between. Requiring one of these terms to actually appear in the title
+# before trusting its number prevents that cross-type mixup (e.g. the same
+# manufacturing figure getting shown under both Manufacturing and Services).
+_PMI_KIND_TERMS = {
+    "manufacturing": ["manufacturing", "factory"],
+    "services": ["services", "service sector", "non-manufacturing", "whole economy", "private sector"],
+}
+
+
+def _title_matches_pmi_kind(title, kind):
+    terms = _PMI_KIND_TERMS.get(kind.lower(), [kind.lower()])
+    return any(re.search(re.escape(t), title, re.IGNORECASE) for t in terms)
+
 
 @st.cache_data(ttl=CACHE_TTL)
 def fetch_pmi_data():
@@ -420,10 +446,12 @@ def fetch_pmi_data():
     soon as a reputable outlet reports it.
 
     Accuracy safeguards: a number is only ever extracted from a REPUTABLE
-    outlet's headline — never from an unvetted aggregator — and any parsed
-    value outside PMI_VALID_RANGE is treated as a failed parse rather than
-    displayed, since a number that far off is far more likely a misparse
-    than a real reading."""
+    outlet's headline that actually mentions the requested PMI type (see
+    _title_matches_pmi_kind — prevents e.g. a manufacturing-only headline's
+    figure from being shown under Services just because it also matched
+    that query); and any parsed value outside PMI_VALID_RANGE is treated as
+    a failed parse rather than displayed, since a number that far off is
+    far more likely a misparse than a real reading."""
     results = {}
     for (country, kind), variants in PMI_QUERY_VARIANTS.items():
         results.setdefault(country, {})
@@ -434,11 +462,13 @@ def fetch_pmi_data():
                 reputable, fallback = _fetch_pmi_candidates(query)
                 # Headline display (incl. fallback for the "no parse" case)
                 # can use any source; but a NUMBER is only ever trusted from
-                # a reputable one.
+                # a reputable one that's actually about this PMI type.
                 display_candidates = (reputable or fallback)[:PMI_CANDIDATES_TO_SCAN]
                 if display_candidates and best_fallback_item is None:
                     best_fallback_item = display_candidates[0]
                 for item in reputable[:PMI_CANDIDATES_TO_SCAN]:
+                    if not _title_matches_pmi_kind(item["title"], kind):
+                        continue
                     value, prev = _parse_pmi_value(item["title"], keyword=kind)
                     if value is not None and PMI_VALID_RANGE[0] <= value <= PMI_VALID_RANGE[1]:
                         parsed_item = {**item, "value": value, "prev": prev}
