@@ -9,6 +9,7 @@ Data refreshes automatically every 5 minutes (adjustable via CACHE_TTL below).
 
 import datetime
 import re
+import time
 from urllib.parse import quote_plus
 
 import feedparser
@@ -239,6 +240,54 @@ REPUTABLE_SOURCES = [
 ]
 
 
+# Google News RSS is fronted by Google and can return an empty feed (no
+# exception, just zero entries) instead of an HTTP error when it doesn't
+# like the request — most commonly because (a) the request has no/odd
+# User-Agent, which feedparser's default urllib fetch doesn't set to
+# anything browser-like, or (b) too many requests arrive in a short burst
+# from the same IP, which is exactly what the PMI and Employment sections
+# do (up to ~30 sequential RSS calls each cache cycle, vs. 4 for the News
+# section) — and Streamlit Community Cloud apps share a small pool of
+# outbound IPs across many free-tier apps, making that burst limit easier
+# to hit than on a home connection. `_fetch_feed_with_retry` below adds a
+# browser-like User-Agent, a short jittered pause before each request, and
+# one retry on an empty/erroring response to make this failure mode much
+# less likely without changing what actually gets displayed.
+NEWS_REQUEST_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    ),
+}
+_MIN_SECONDS_BETWEEN_NEWS_REQUESTS = 0.35  # keeps request rate polite
+_last_news_request_ts = [0.0]  # mutable single-item container, shared across calls
+
+
+def _fetch_feed_with_retry(url, retries=2, backoff=1.2):
+    """feedparser.parse(url) with a browser-like User-Agent, light request
+    pacing, and a retry on empty/erroring results. Returns the parsed feed
+    (possibly still empty if every attempt failed/found nothing — that's a
+    real "no headlines" outcome, not swallowed here)."""
+    last_feed = None
+    for attempt in range(retries + 1):
+        elapsed = time.monotonic() - _last_news_request_ts[0]
+        if elapsed < _MIN_SECONDS_BETWEEN_NEWS_REQUESTS:
+            time.sleep(_MIN_SECONDS_BETWEEN_NEWS_REQUESTS - elapsed)
+        _last_news_request_ts[0] = time.monotonic()
+        feed = feedparser.parse(url, request_headers=NEWS_REQUEST_HEADERS)
+        last_feed = feed
+        got_entries = bool(getattr(feed, "entries", None))
+        # bozo=1 means feedparser hit a parse/HTTP-level problem (e.g. a
+        # non-200 or non-XML response, which is what a block/rate-limit
+        # typically looks like here).
+        looked_blocked = bool(getattr(feed, "bozo", 0)) and not got_entries
+        if got_entries or not looked_blocked:
+            return feed
+        if attempt < retries:
+            time.sleep(backoff * (attempt + 1))
+    return last_feed
+
+
 # ---------------------------------------------------------------------------
 # DATA FETCHING (all cached so the app doesn't hammer sources on every click)
 # ---------------------------------------------------------------------------
@@ -397,7 +446,7 @@ def _pmi_news_query_url(query, window="45d"):
 def _fetch_pmi_candidates(query):
     """Fetch one query's headlines, split into reputable vs. other, each
     already cleaned up via _build_item."""
-    feed = feedparser.parse(_pmi_news_query_url(query))
+    feed = _fetch_feed_with_retry(_pmi_news_query_url(query))
     reputable, fallback = [], []
     for e in feed.entries:
         source = _source_name(e)
@@ -457,9 +506,12 @@ def fetch_pmi_data():
         results.setdefault(country, {})
         best_fallback_item = None
         parsed_item = None
+        any_entries_seen = False
         try:
             for query in variants:
                 reputable, fallback = _fetch_pmi_candidates(query)
+                if reputable or fallback:
+                    any_entries_seen = True
                 # Headline display (incl. fallback for the "no parse" case)
                 # can use any source; but a NUMBER is only ever trusted from
                 # a reputable one that's actually about this PMI type.
@@ -480,8 +532,22 @@ def fetch_pmi_data():
                 results[country][kind] = parsed_item
             elif best_fallback_item:
                 results[country][kind] = {**best_fallback_item, "value": None, "prev": None}
-            else:
+            elif any_entries_seen:
+                # We got headlines back but none matched this PMI type
+                # closely enough to trust — a real (if unhelpful) result.
                 results[country][kind] = None
+            else:
+                # Every single query variant came back with zero RSS
+                # entries — with several differently-worded queries all
+                # striking out, that's almost always Google News RSS
+                # blocking/rate-limiting the request rather than there
+                # genuinely being no coverage anywhere. Flagged distinctly
+                # so it reads as "try refreshing" rather than "nothing to
+                # report".
+                results[country][kind] = {
+                    "title": "", "link": "", "source": "", "published": "",
+                    "value": None, "prev": None, "fetch_blocked": True,
+                }
         except Exception as e:
             results[country][kind] = {"title": f"Error: {e}", "link": "", "source": "",
                                        "published": "", "value": None, "prev": None}
@@ -546,7 +612,7 @@ def _employment_news_query_url(query, window):
 def _fetch_employment_candidates(query, window):
     """Fetch one query's headlines, split into reputable vs. other, each
     already cleaned up via _build_item."""
-    feed = feedparser.parse(_employment_news_query_url(query, window))
+    feed = _fetch_feed_with_retry(_employment_news_query_url(query, window))
     reputable, fallback = [], []
     for e in feed.entries:
         source = _source_name(e)
@@ -667,9 +733,12 @@ def fetch_employment_data():
 
         best_fallback_item = None
         parsed_item = None
+        any_entries_seen = False
         try:
             for query in cfg["variants"]:
                 reputable, fallback = _fetch_employment_candidates(query, cfg["window"])
+                if reputable or fallback:
+                    any_entries_seen = True
                 display_candidates = (reputable or fallback)[:EMPLOYMENT_CANDIDATES_TO_SCAN]
                 parse_candidates = reputable[:EMPLOYMENT_CANDIDATES_TO_SCAN]
                 if cfg["kind"] == "rate":
@@ -703,8 +772,18 @@ def fetch_employment_data():
                 results[country][metric] = {**parsed_item, "kind": cfg["kind"]}
             elif best_fallback_item:
                 results[country][metric] = {**best_fallback_item, "value": None, "prev": None, "kind": cfg["kind"]}
-            else:
+            elif any_entries_seen:
                 results[country][metric] = None
+            else:
+                # Every query variant came back with zero RSS entries —
+                # with multiple differently-worded queries all striking
+                # out, that's almost always Google News RSS blocking/
+                # rate-limiting the request rather than genuinely no
+                # coverage anywhere.
+                results[country][metric] = {
+                    "title": "", "link": "", "source": "", "published": "",
+                    "value": None, "prev": None, "kind": cfg["kind"], "fetch_blocked": True,
+                }
         except Exception as e:
             results[country][metric] = {"title": f"Error: {e}", "link": "", "source": "",
                                          "published": "", "value": None, "prev": None, "kind": cfg["kind"]}
@@ -716,7 +795,7 @@ def fetch_news():
     news = {}
     for market, url in NEWS_FEEDS.items():
         try:
-            feed = feedparser.parse(url)
+            feed = _fetch_feed_with_retry(url)
             reputable, fallback = [], []
             for e in feed.entries:
                 source = _source_name(e)
@@ -837,6 +916,10 @@ def _render_pmi(pmi_data):
                 if not item:
                     st.caption(f"{kind} PMI: _no data available right now._")
                     continue
+                if item.get("fetch_blocked"):
+                    st.caption(f"{kind} PMI: _couldn't reach the news source just now "
+                               f"(likely rate-limited) — try 🔄 Refresh in a minute._")
+                    continue
                 if item["value"] is not None:
                     if item["prev"] is not None:
                         st.metric(f"{kind} PMI", f"{item['value']:.1f}",
@@ -868,6 +951,10 @@ def _render_employment(employment_data):
                 item = employment_data.get(country, {}).get(metric)
                 if not item:
                     st.caption(f"{metric}: _no data available right now._")
+                    continue
+                if item.get("fetch_blocked"):
+                    st.caption(f"{metric}: _couldn't reach the news source just now "
+                               f"(likely rate-limited) — try 🔄 Refresh in a minute._")
                     continue
                 if item["value"] is not None:
                     if item["kind"] == "rate":
