@@ -94,6 +94,35 @@ TOP_STOCKS_UNIVERSE = {
         "V03.SI": "Venture Corporation", "S63.SI": "ST Engineering", "U96.SI": "Sembcorp Industries",
     },
 }
+# Manufacturing & Services PMI (Purchasing Managers' Index) for a curated set
+# of markets. There's no free real-time numeric API for PMI (ISM/S&P
+# Global/NBS all license the raw data commercially), so instead of a fixed
+# snapshot we treat this the same way the News section already does: poll
+# Google News RSS for the latest reputable-outlet headline reporting each
+# release, and parse the figure straight out of that headline. Because it's
+# re-fetched on every cache cycle, a new PMI print shows up here automatically
+# as soon as a reputable outlet reports it — no manual updates needed. If a
+# headline's wording can't be parsed into a number, we still surface the
+# headline itself (with a link back to the source) rather than guessing.
+# `when:35d` keeps the search window wide enough to span a monthly release
+# cycle even if a source is a few days late reporting it.
+# Primary reputable compilers behind each series:
+#   - United States: Institute for Supply Management (ISM)
+#   - China:         National Bureau of Statistics of China (NBS, official)
+#   - India:         S&P Global
+#   - Singapore:     SIPMM for manufacturing; S&P Global for services/whole-economy
+#                    (Singapore has no separate dedicated services PMI of its own)
+PMI_FEEDS = {
+    ("United States", "Manufacturing"): "https://news.google.com/rss/search?q=%22ISM+Manufacturing+PMI%22+when:35d&hl=en-US&gl=US&ceid=US:en",
+    ("United States", "Services"):      "https://news.google.com/rss/search?q=%22ISM+Services+PMI%22+when:35d&hl=en-US&gl=US&ceid=US:en",
+    ("China", "Manufacturing"):         "https://news.google.com/rss/search?q=China+manufacturing+PMI+NBS+when:35d&hl=en-US&gl=US&ceid=US:en",
+    ("China", "Services"):              "https://news.google.com/rss/search?q=China+non-manufacturing+PMI+when:35d&hl=en-US&gl=US&ceid=US:en",
+    ("India", "Manufacturing"):         "https://news.google.com/rss/search?q=India+%22Manufacturing+PMI%22+S%26P+Global+when:35d&hl=en-US&gl=US&ceid=US:en",
+    ("India", "Services"):              "https://news.google.com/rss/search?q=India+%22Services+PMI%22+S%26P+Global+when:35d&hl=en-US&gl=US&ceid=US:en",
+    ("Singapore", "Manufacturing"):     "https://news.google.com/rss/search?q=Singapore+Manufacturing+PMI+SIPMM+when:35d&hl=en-US&gl=US&ceid=US:en",
+    ("Singapore", "Services"):          "https://news.google.com/rss/search?q=Singapore+PMI+%22S%26P+Global%22+when:35d&hl=en-US&gl=US&ceid=US:en",
+}
+
 TOP_PERFORMERS_COUNT = 10  # how many top gainers to show per market
 
 # Currency each market's share prices are quoted in (for display purposes).
@@ -224,6 +253,68 @@ def _build_item(entry, source):
     }
 
 
+def _parse_pmi_value(title):
+    """Best-effort extraction of (value, previous_value) from a PMI headline.
+    Returns (value, prev) with either possibly None if not confidently parsed.
+    Handles the common financial-news phrasings, e.g.:
+      "...PMI rose to 51.3 in June 2026 from 51.0 in May"   -> (51.3, 51.0)
+      "...PMI eased to 54.2 in June from 55.0 in May"       -> (54.2, 55.0)
+      "Manufacturing PMI at 53.3%; June 2026 ISM Report"    -> (53.3, None)
+    """
+    # Pattern 1: two numbers linked by "... from ..." (gives current + prior)
+    m = re.search(
+        r"(\d{2,3}(?:\.\d+)?)\s*%?[^.\n]{0,45}?\bfrom\b\s*(\d{2,3}(?:\.\d+)?)",
+        title, re.IGNORECASE,
+    )
+    if m:
+        return float(m.group(1)), float(m.group(2))
+    # Pattern 2: a single "NN.N%" figure
+    m = re.search(r"(\d{2,3}(?:\.\d+)?)\s*%", title)
+    if m:
+        return float(m.group(1)), None
+    # Pattern 3: "PMI ... <number>" without a percent sign
+    m = re.search(r"PMI\D{0,15}(\d{2,3}(?:\.\d+)?)", title, re.IGNORECASE)
+    if m:
+        return float(m.group(1)), None
+    return None, None
+
+
+@st.cache_data(ttl=CACHE_TTL)
+def fetch_pmi_data():
+    """For each (country, PMI type), pull the latest reputable-outlet headline
+    reporting that release from Google News RSS and try to parse the reading
+    out of it. Re-run every cache cycle, so a fresh release shows up here as
+    soon as a reputable outlet reports it."""
+    results = {}
+    for (country, kind), url in PMI_FEEDS.items():
+        results.setdefault(country, {})
+        try:
+            feed = feedparser.parse(url)
+            reputable, fallback = [], []
+            for e in feed.entries:
+                source = _source_name(e)
+                item = _build_item(e, source)
+                (reputable if _is_reputable(source) else fallback).append(item)
+            chosen = (reputable or fallback)
+            if not chosen:
+                results[country][kind] = None
+                continue
+            item = chosen[0]
+            value, prev = _parse_pmi_value(item["title"])
+            results[country][kind] = {
+                "title": item["title"],
+                "link": item["link"],
+                "source": item["source"],
+                "published": item["published"],
+                "value": value,
+                "prev": prev,
+            }
+        except Exception as e:
+            results[country][kind] = {"title": f"Error: {e}", "link": "", "source": "",
+                                       "published": "", "value": None, "prev": None}
+    return results
+
+
 @st.cache_data(ttl=CACHE_TTL)
 def fetch_news():
     news = {}
@@ -333,6 +424,37 @@ def _render_ticker(index_rows, currency_rows):
     st.markdown(html, unsafe_allow_html=True)
 
 
+def _render_pmi(pmi_data):
+    """Render Manufacturing & Services PMI, grouped by country. Each reading
+    is live-fetched (see fetch_pmi_data); if we could parse a number out of
+    the latest headline we show it as a metric with month-over-month delta,
+    otherwise we fall back to showing the headline itself with a source link
+    so the person can read the actual figure at the source."""
+    countries = list(PMI_FEEDS.keys())
+    country_names = list(dict.fromkeys(c for c, _ in countries))  # stable order, de-duped
+    country_cols = st.columns(len(country_names))
+    for col, country in zip(country_cols, country_names):
+        with col:
+            st.markdown(f"**{country}**")
+            for kind in ("Manufacturing", "Services"):
+                item = pmi_data.get(country, {}).get(kind)
+                if not item:
+                    st.caption(f"{kind} PMI: _no data available right now._")
+                    continue
+                if item["value"] is not None:
+                    if item["prev"] is not None:
+                        st.metric(f"{kind} PMI", f"{item['value']:.1f}",
+                                   f"{item['value'] - item['prev']:+.1f}")
+                    else:
+                        st.metric(f"{kind} PMI", f"{item['value']:.1f}")
+                else:
+                    st.markdown(f"**{kind} PMI**")
+                if item["link"]:
+                    st.caption(f"[{item['source'] or 'source'}]({item['link']}) · {item['published']}")
+                else:
+                    st.caption(item["title"])
+
+
 # ---------------------------------------------------------------------------
 # UI
 # ---------------------------------------------------------------------------
@@ -364,6 +486,18 @@ for i, row in enumerate(fetch_currency_data()):
             st.metric(row["label"], row["value"])
         else:
             st.metric(row["label"], row["value"], f"{row['change_pct']:+.2f}%")
+
+st.markdown("##### 🏭 Manufacturing & Services PMI")
+st.caption(
+    "A reading above 50 signals expansion, below 50 signals contraction. PMI is only "
+    "released once a month per country, so unlike the market prices above, a tile only "
+    "changes when a new report actually comes out — but this pulls the latest reputable-"
+    "outlet headline for each release live, every refresh, so a new print appears here as "
+    "soon as it's reported (no manual updates). Sources: ISM (US), National Bureau of "
+    "Statistics of China, S&P Global (India; Singapore services/whole-economy), and SIPMM "
+    "(Singapore manufacturing)."
+)
+_render_pmi(fetch_pmi_data())
 
 st.subheader("📰 Live Market News — SG, US, China, India")
 st.caption(f"Prioritizes reputable outlets (Reuters, Bloomberg, CNBC, FT, WSJ, AP, BBC, and similar); "
@@ -432,6 +566,6 @@ for tab, (market, data) in zip(loser_tabs, top_performers.items()):
 
 st.caption(
     "Data sources: Yahoo Finance (indices/currencies/VIX/yields/top performers), Google News RSS "
-    "(headlines, prioritizing reputable outlets). "
+    "(headlines and PMI readings, prioritizing reputable outlets — ISM, NBS China, S&P Global, SIPMM). "
     "This is informational only, not financial advice."
 )
