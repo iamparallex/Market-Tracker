@@ -1015,87 +1015,58 @@ def _render_headline_banner(news):
     st.markdown(html_out, unsafe_allow_html=True)
 
 
-def _render_pmi(pmi_data):
-    """Render Manufacturing & Services PMI, grouped by country. Each reading
-    is live-fetched (see fetch_pmi_data); if we could parse a number out of
-    the latest headline we show it as a metric with month-over-month delta,
-    otherwise we fall back to showing the headline itself with a source link
-    so the person can read the actual figure at the source."""
-    countries = list(PMI_QUERY_VARIANTS.keys())
-    country_names = list(dict.fromkeys(c for c, _ in countries))  # stable order, de-duped
-    country_cols = st.columns(len(country_names))
-    for col, country in zip(country_cols, country_names):
-        with col:
-            st.markdown(f"**{country}**")
-            for kind in ("Manufacturing", "Services"):
-                item = pmi_data.get(country, {}).get(kind)
-                if not item:
-                    st.caption(f"{kind} PMI: _no data available right now._")
-                    continue
-                if item.get("fetch_blocked"):
-                    st.caption(f"{kind} PMI: _couldn't reach the news source just now "
-                               f"(likely rate-limited) — try 🔄 Refresh in a minute._")
-                    continue
-                if item["value"] is not None:
-                    if item["prev"] is not None:
-                        st.metric(f"{kind} PMI", f"{item['value']:.1f}",
-                                   f"{item['value'] - item['prev']:+.1f}")
-                    else:
-                        st.metric(f"{kind} PMI", f"{item['value']:.1f}")
-                else:
-                    # No number could be confidently parsed — still surface
-                    # the actual headline text (not just a bare label) so
-                    # the person can see what was found and click through,
-                    # rather than the tile looking like nothing loaded.
-                    st.markdown(f"**{kind} PMI**")
-                    if item.get("title"):
-                        st.caption(item["title"])
-                if item["link"]:
-                    st.caption(f"[{item['source'] or 'source'}]({item['link']}) · {item['published']}")
-                elif not item["value"] and not item.get("title"):
-                    st.caption("_no parseable figure found — try 🔄 Refresh._")
+def _render_metric_tile(label, item, unit_suffix=""):
+    """Render a single US economic-indicator tile (PMI, unemployment rate, or
+    payrolls). Shows a live metric with period-over-period delta when a
+    number was parsed; otherwise falls back to the actual headline text (not
+    just a bare label) with a source link, so a failed parse never just
+    looks like missing data."""
+    if not item:
+        st.markdown(f"**{label}**")
+        st.caption("_no data available right now._")
+        return
+    if item.get("fetch_blocked"):
+        st.markdown(f"**{label}**")
+        st.caption("_couldn't reach the news source just now (likely rate-limited) — try 🔄 Refresh in a minute._")
+        return
+    if item["value"] is not None:
+        if item.get("kind") == "payrolls":
+            st.metric(label, f"{item['value']:+,.0f} jobs")
+        else:
+            delta = f"{item['value'] - item['prev']:+.1f}" if item.get("prev") is not None else None
+            st.metric(label, f"{item['value']:.1f}{unit_suffix}", delta)
+    else:
+        st.markdown(f"**{label}**")
+        if item.get("title"):
+            st.caption(item["title"])
+    if item["link"]:
+        st.caption(f"[{item['source'] or 'source'}]({item['link']}) · {item['published']}")
+    elif not item["value"] and not item.get("title"):
+        st.caption("_no parseable figure found — try 🔄 Refresh._")
 
 
-def _render_employment(employment_data):
-    """Render unemployment rate (all 4 markets) & US Non-Farm Payrolls,
-    grouped by country. Each reading is live-fetched (see
-    fetch_employment_data); if we could parse a figure out of the latest
-    headline we show it as a metric with month-over-month delta where
-    available, otherwise we fall back to showing the headline itself with a
-    source link so the person can read the actual figure at the source."""
-    country_names = list(dict.fromkeys(c for c, _ in EMPLOYMENT_METRICS.keys()))
-    country_cols = st.columns(len(country_names))
-    for col, country in zip(country_cols, country_names):
-        with col:
-            st.markdown(f"**{country}**")
-            metrics_for_country = [m for c, m in EMPLOYMENT_METRICS.keys() if c == country]
-            for metric in metrics_for_country:
-                item = employment_data.get(country, {}).get(metric)
-                if not item:
-                    st.caption(f"{metric}: _no data available right now._")
-                    continue
-                if item.get("fetch_blocked"):
-                    st.caption(f"{metric}: _couldn't reach the news source just now "
-                               f"(likely rate-limited) — try 🔄 Refresh in a minute._")
-                    continue
-                if item["value"] is not None:
-                    if item["kind"] == "rate":
-                        delta = f"{item['value'] - item['prev']:+.1f}" if item["prev"] is not None else None
-                        st.metric(metric, f"{item['value']:.1f}%", delta)
-                    else:  # payrolls, in jobs added/lost
-                        st.metric(metric, f"{item['value']:+,.0f} jobs")
-                else:
-                    # No number could be confidently parsed — still surface
-                    # the actual headline text (not just a bare label) so
-                    # the person can see what was found and click through,
-                    # rather than the tile looking like nothing loaded.
-                    st.markdown(f"**{metric}**")
-                    if item.get("title"):
-                        st.caption(item["title"])
-                if item["link"]:
-                    st.caption(f"[{item['source'] or 'source'}]({item['link']}) · {item['published']}")
-                elif not item["value"] and not item.get("title"):
-                    st.caption("_no parseable figure found — try 🔄 Refresh._")
+def _render_us_economic_indicators(pmi_data, employment_data):
+    """Render Manufacturing PMI, Services PMI, Unemployment Rate, and
+    Non-Farm Payrolls together in one section — all four are United States
+    figures now, so they share a single row instead of being split across
+    two sections."""
+    cols = st.columns(4)
+    with cols[0]:
+        _render_metric_tile("Manufacturing PMI", pmi_data.get("United States", {}).get("Manufacturing"))
+    with cols[1]:
+        _render_metric_tile("Services PMI", pmi_data.get("United States", {}).get("Services"))
+    with cols[2]:
+        _render_metric_tile(
+            "Unemployment Rate",
+            employment_data.get("United States", {}).get("Unemployment Rate"),
+            unit_suffix="%",
+        )
+    with cols[3]:
+        _render_metric_tile(
+            "Non-Farm Payrolls",
+            employment_data.get("United States", {}).get("Non-Farm Payrolls"),
+        )
+
 
 
 # ---------------------------------------------------------------------------
@@ -1150,30 +1121,22 @@ for i, row in enumerate(fetch_commodity_data()):
         else:
             st.metric(row["label"], row["value"], f"{row['change_pct']:+.2f}%")
 
-st.markdown("##### 🏭 Manufacturing & Services PMI (United States)")
+st.markdown("##### 🏭 US Economic Indicators — PMI, Unemployment & Payrolls")
 st.caption(
-    "A reading above 50 signals expansion, below 50 signals contraction. There's no free "
-    "real-time official API for PMI (ISM licenses the raw data commercially), so this pulls "
-    "the latest *reputable-outlet* headline reporting each release, live, every refresh — a "
-    "number is never extracted from an unvetted source, and never displayed if it falls "
-    "outside a plausible PMI range, so a misparse shows as 'no data' rather than a wrong "
-    "figure. PMI is only released once a month, so a tile only changes when a new report "
-    "actually comes out. Source: Institute for Supply Management (ISM)."
+    "Manufacturing/Services PMI (a reading above 50 signals expansion, below 50 signals "
+    "contraction), Unemployment Rate, and Non-Farm Payrolls, all for the United States. "
+    "There's no free real-time numeric API for PMI (ISM licenses the raw data commercially), "
+    "so it's parsed live from the latest *reputable-outlet* headline reporting each release — "
+    "a number is never extracted from an unvetted source, and never displayed if it falls "
+    "outside a plausible range, so a misparse shows as 'no data' rather than a wrong figure. "
+    "Unemployment Rate and Non-Farm Payrolls pull directly from FRED — the Federal Reserve's "
+    "official data API serving real Bureau of Labor Statistics numbers — when a free FRED API "
+    "key is configured (see the code comment near FRED_SERIES_IDS); otherwise they use the "
+    "same live-headline approach as PMI. All four are only released monthly, so a tile only "
+    "changes when a new report actually comes out. Sources: Institute for Supply Management "
+    "(ISM) and U.S. Bureau of Labor Statistics (BLS)."
 )
-_render_pmi(fetch_pmi_data())
-
-st.markdown("##### 👷 Unemployment & Non-Farm Payrolls (United States)")
-st.caption(
-    "US Unemployment Rate and Non-Farm Payrolls. Figures pull directly from FRED — the "
-    "Federal Reserve's official data API serving real Bureau of Labor Statistics numbers — "
-    "when a free FRED API key is configured (see the code comment near FRED_SERIES_IDS); "
-    "otherwise figures are parsed from the latest *reputable-outlet* headline reporting each "
-    "release, live, every refresh — never from an unvetted source, and never displayed if the "
-    "extracted number falls outside a plausible range for that metric. These are only "
-    "released monthly, so a tile only changes when a new report actually comes out. Source: "
-    "U.S. Bureau of Labor Statistics (BLS)."
-)
-_render_employment(fetch_employment_data())
+_render_us_economic_indicators(fetch_pmi_data(), fetch_employment_data())
 
 st.subheader("📰 Live Market News — SG, US, China, India")
 st.caption(f"Prioritizes reputable outlets (Reuters, Bloomberg, CNBC, FT, WSJ, AP, BBC, and similar); "
