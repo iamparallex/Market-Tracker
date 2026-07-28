@@ -47,17 +47,19 @@ CURRENCIES = {
     "NZD/USD":                {"ticker": "NZDUSD=X", "invert": False},  # already NZD->USD
 }
 
-# Commodities section — live benchmark/spot prices sourced from the same
-# Yahoo Finance feed already used for indices and currencies above, so these
+# Commodities section — live benchmark prices sourced from the same Yahoo
+# Finance feed already used for indices and currencies above, so these
 # refresh on the same CACHE_TTL cycle rather than being a static figure.
-# "BZ=F" is the ICE Brent Crude near-month futures contract — the standard
-# live-quoted benchmark price for Brent crude. "XAUUSD=X"/"XAGUSD=X" are
-# Yahoo Finance's gold/silver SPOT (vs. USD) tickers, distinct from the
-# COMEX futures tickers (GC=F/SI=F), matching what was asked for.
+# "BZ=F" (ICE Brent Crude) and "GC=F"/"SI=F" (COMEX Gold/Silver) are
+# near-month futures contracts — the standard, reliably-quoted live proxy
+# for these commodities' prices (this is what most market trackers display
+# as "spot" gold/silver, since Yahoo Finance's dedicated spot tickers
+# XAUUSD=X/XAGUSD=X frequently return no usable last/previous-close data
+# through fast_info and were dropping out on refresh).
 COMMODITIES = {
-    "Brent Crude":  {"ticker": "BZ=F",     "unit": "/bbl"},
-    "Gold Spot":    {"ticker": "XAUUSD=X", "unit": "/oz"},
-    "Silver Spot":  {"ticker": "XAGUSD=X", "unit": "/oz"},
+    "Brent Crude":  {"ticker": "BZ=F", "unit": "/bbl"},
+    "Gold Spot":    {"ticker": "GC=F", "unit": "/oz"},
+    "Silver Spot":  {"ticker": "SI=F", "unit": "/oz"},
 }
 
 # Curated set of large, liquid constituents from each market's major index,
@@ -109,64 +111,39 @@ TOP_STOCKS_UNIVERSE = {
         "V03.SI": "Venture Corporation", "S63.SI": "ST Engineering", "U96.SI": "Sembcorp Industries",
     },
 }
-# Manufacturing & Services PMI (Purchasing Managers' Index) for a curated set
-# of markets. There's no free real-time numeric API for PMI (ISM/S&P
-# Global/NBS all license the raw data commercially), so instead of a fixed
-# snapshot we treat this the same way the News section already does: poll
-# Google News RSS for the latest reputable-outlet headline reporting each
-# release, and parse the figure straight out of that headline. Because it's
-# re-fetched on every cache cycle, a new PMI print shows up here automatically
-# as soon as a reputable outlet reports it — no manual updates needed. If a
-# headline's wording can't be parsed into a number, we still surface the
-# headline itself (with a link back to the source) rather than guessing.
+# Manufacturing & Services PMI (Purchasing Managers' Index) — United States
+# only. There's no free real-time numeric API for PMI (ISM/S&P Global/NBS
+# all license the raw data commercially), so instead of a fixed snapshot we
+# treat this the same way the News section already does: poll Google News
+# RSS for the latest reputable-outlet headline reporting each release, and
+# parse the figure straight out of that headline. Because it's re-fetched on
+# every cache cycle, a new PMI print shows up here automatically as soon as
+# a reputable outlet reports it — no manual updates needed. If a headline's
+# wording can't be parsed into a number, we still surface the headline
+# itself (with a link back to the source) rather than guessing.
 #
 # Each entry below is a *list* of plain search-term variants (no boolean
 # operators/parentheses — Google News RSS handles those inconsistently) tried
 # in order; we also scan several matching headlines per variant, since a
-# narrative-style headline (e.g. "China's factory activity expands for a
-# third month") often omits the actual number even when it's a perfectly good
+# narrative-style headline (e.g. "Factory activity expands for a third
+# month") often omits the actual number even when it's a perfectly good
 # reputable source, while a data-provider press release usually states it
 # plainly (e.g. "Manufacturing PMI at 53.3%"). `when:35d` keeps the window
 # wide enough to span a monthly release cycle even if a source reports late.
-# Primary reputable compilers behind each series:
-#   - United States: Institute for Supply Management (ISM)
-#   - China:         National Bureau of Statistics of China (NBS, official)
-#   - India:         S&P Global (branded "HSBC India PMI" in most headlines)
-#   - Singapore:     SIPMM for manufacturing; S&P Global for services/whole-economy
-#                    (Singapore has no separate dedicated services PMI of its own)
+# Primary reputable compiler: Institute for Supply Management (ISM).
 PMI_QUERY_VARIANTS = {
     ("United States", "Manufacturing"): ['"ISM Manufacturing PMI"'],
     ("United States", "Services"):      ['"ISM Services PMI"'],
-    ("China", "Manufacturing"):         ["China manufacturing PMI", "China factory activity PMI NBS"],
-    ("China", "Services"):              ["China non-manufacturing PMI", "China services PMI NBS"],
-    ("India", "Manufacturing"):         ["HSBC India Manufacturing PMI", "India Manufacturing PMI S&P Global"],
-    ("India", "Services"):              [
-        "HSBC India Services PMI", "India Services PMI S&P Global",
-        "India services PMI", "India services activity PMI",
-    ],
-    ("Singapore", "Manufacturing"):     ["Singapore Manufacturing PMI SIPMM"],
-    ("Singapore", "Services"):          [
-        "Singapore PMI S&P Global", "Singapore private sector PMI",
-        "Singapore services PMI", "Singapore whole economy PMI",
-    ],
 }
 PMI_CANDIDATES_TO_SCAN = 8  # how many headlines per query variant to check for a parseable number
 
-# Unemployment rate & (US) Non-Farm Payrolls, same live-headline approach as
-# PMI above: there's no free real-time numeric API for these either, so we
-# poll Google News RSS for the latest reputable-outlet headline reporting
-# each release and parse the figure out of it. Re-fetched every cache cycle,
-# so a new print appears automatically as soon as a reputable outlet reports
-# it. "Non-Farm Payrolls" is a US-specific report (from the same monthly BLS
-# jobs release as the unemployment rate) — China, India, and Singapore don't
-# publish an equivalent payrolls figure, so only their unemployment rate is
-# tracked. `window` is widened for Singapore since MOM only reports labour
-# market data quarterly, not monthly.
-# Primary reputable compilers behind each series:
-#   - United States: Bureau of Labor Statistics (BLS)
-#   - China:         National Bureau of Statistics of China (NBS) — surveyed urban unemployment rate
-#   - India:         Ministry of Statistics & Programme Implementation (MoSPI) / CMIE
-#   - Singapore:     Ministry of Manpower (MOM)
+# Unemployment rate & Non-Farm Payrolls — United States only, same
+# live-headline approach as PMI above: there's no free real-time numeric API
+# for these either, so we poll Google News RSS for the latest reputable-
+# outlet headline reporting each release and parse the figure out of it.
+# Re-fetched every cache cycle, so a new print appears automatically as soon
+# as a reputable outlet reports it.
+# Primary reputable compiler: U.S. Bureau of Labor Statistics (BLS).
 EMPLOYMENT_METRICS = {
     ("United States", "Unemployment Rate"): {
         "kind": "rate",
@@ -178,44 +155,12 @@ EMPLOYMENT_METRICS = {
         "window": "35d",
         "variants": ['"nonfarm payrolls" BLS', "US jobs report payrolls added"],
     },
-    ("China", "Unemployment Rate"): {
-        "kind": "rate",
-        "window": "35d",
-        # "-youth" tries to steer the query away from China's separate,
-        # much-higher youth-unemployment figure (a distinct, heavily
-        # reported series); we also filter any "youth" headline out in code
-        # below as a backstop, since the query-level exclusion isn't
-        # guaranteed to work on every source.
-        "variants": [
-            "China surveyed urban unemployment rate NBS -youth",
-            "China unemployment rate -youth",
-            "China jobless rate National Bureau Statistics",
-            "China urban unemployment rate percent",
-        ],
-    },
-    ("India", "Unemployment Rate"): {
-        "kind": "rate",
-        "window": "35d",
-        "variants": [
-            "India unemployment rate CMIE", "India unemployment rate MoSPI",
-            "India unemployment rate PLFS", "India jobless rate",
-        ],
-    },
-    ("Singapore", "Unemployment Rate"): {
-        "kind": "rate",
-        "window": "100d",
-        "variants": [
-            "Singapore unemployment rate MOM", "Singapore unemployment rate Ministry of Manpower",
-            "Singapore resident unemployment rate",
-        ],
-    },
 }
 EMPLOYMENT_CANDIDATES_TO_SCAN = 12  # how many headlines per query variant to check for a parseable number
 # Headlines containing any of these are skipped for rate parsing even if they
 # have a percent figure — they report a related-but-different, much more
-# volatile sub-metric (e.g. China and India both separately report youth
-# unemployment, which runs far higher than the overall/general rate) that
-# would otherwise get misattributed as the headline figure.
+# volatile sub-metric (youth unemployment runs far higher than the overall
+# rate) that would otherwise get misattributed as the headline figure.
 EMPLOYMENT_RATE_EXCLUDE_TERMS = ["youth", "graduate", "young people"]
 
 TOP_PERFORMERS_COUNT = 10  # how many top gainers to show per market
@@ -346,13 +291,31 @@ def fetch_currency_data():
 @st.cache_data(ttl=CACHE_TTL)
 def fetch_commodity_data():
     """Live Brent crude / gold spot / silver spot prices from Yahoo Finance,
-    same live-refresh approach as fetch_currency_data above."""
+    same live-refresh approach as fetch_currency_data above. Falls back to
+    recent daily bars via .history() if fast_info doesn't have a usable
+    last/previous-close pair for a given ticker (this happens occasionally
+    for futures contracts around rollover), so a tile doesn't go blank just
+    because one particular field was momentarily unavailable."""
     rows = []
     for label, meta in COMMODITIES.items():
         try:
-            info = yf.Ticker(meta["ticker"]).fast_info
-            last, prev = info["lastPrice"], info["previousClose"]
-            pct = (last - prev) / prev * 100 if prev else 0.0
+            ticker_obj = yf.Ticker(meta["ticker"])
+            last, prev = None, None
+            try:
+                info = ticker_obj.fast_info
+                last, prev = info["lastPrice"], info["previousClose"]
+            except Exception:
+                last, prev = None, None
+            if not last or not prev:
+                hist = ticker_obj.history(period="5d")
+                closes = hist["Close"].dropna()
+                if len(closes) >= 2:
+                    last, prev = float(closes.iloc[-1]), float(closes.iloc[-2])
+                elif len(closes) == 1:
+                    last, prev = float(closes.iloc[-1]), None
+            if not last:
+                raise ValueError("no usable price data returned")
+            pct = (last - prev) / prev * 100 if prev else None
             display = f"${last:,.2f}{meta['unit']}"
             rows.append({"label": label, "value": display, "change_pct": pct})
         except Exception as e:
@@ -1187,35 +1150,28 @@ for i, row in enumerate(fetch_commodity_data()):
         else:
             st.metric(row["label"], row["value"], f"{row['change_pct']:+.2f}%")
 
-st.markdown("##### 🏭 Manufacturing & Services PMI")
+st.markdown("##### 🏭 Manufacturing & Services PMI (United States)")
 st.caption(
     "A reading above 50 signals expansion, below 50 signals contraction. There's no free "
-    "real-time official API for PMI (ISM/S&P Global/NBS license the raw data commercially), "
-    "so this pulls the latest *reputable-outlet* headline reporting each release, live, every "
-    "refresh — a number is never extracted from an unvetted source, and never displayed if it "
-    "falls outside a plausible PMI range, so a misparse shows as 'no data' rather than a wrong "
-    "figure. PMI is only released once a month per country, so a tile only changes when a new "
-    "report actually comes out. Sources: ISM (US), National Bureau of Statistics of China, "
-    "S&P Global (India; Singapore services/whole-economy), and SIPMM (Singapore manufacturing)."
+    "real-time official API for PMI (ISM licenses the raw data commercially), so this pulls "
+    "the latest *reputable-outlet* headline reporting each release, live, every refresh — a "
+    "number is never extracted from an unvetted source, and never displayed if it falls "
+    "outside a plausible PMI range, so a misparse shows as 'no data' rather than a wrong "
+    "figure. PMI is only released once a month, so a tile only changes when a new report "
+    "actually comes out. Source: Institute for Supply Management (ISM)."
 )
 _render_pmi(fetch_pmi_data())
 
-st.markdown("##### 👷 Unemployment & Non-Farm Payrolls")
+st.markdown("##### 👷 Unemployment & Non-Farm Payrolls (United States)")
 st.caption(
-    "Unemployment rate for the US, China, India and Singapore, plus US Non-Farm "
-    "Payrolls (the US doesn't have a direct equivalent published for the other "
-    "three markets). US figures pull directly from FRED — the Federal Reserve's "
-    "official data API serving real Bureau of Labor Statistics numbers — when a "
-    "free FRED API key is configured (see the code comment near FRED_SERIES_IDS); "
-    "otherwise, and always for China/India/Singapore (no free real-time official "
-    "API exists for these), figures are parsed from the latest *reputable-outlet* "
-    "headline reporting each release, live, every refresh — never from an unvetted "
-    "source, and never displayed if the extracted number falls outside a plausible "
-    "range for that metric. These are only released monthly (quarterly for "
-    "Singapore's MOM labour market report), so a tile only changes when a new "
-    "report actually comes out. Sources: U.S. Bureau of Labor Statistics (BLS), "
-    "National Bureau of Statistics of China, MoSPI/CMIE (India), and Ministry of "
-    "Manpower (Singapore)."
+    "US Unemployment Rate and Non-Farm Payrolls. Figures pull directly from FRED — the "
+    "Federal Reserve's official data API serving real Bureau of Labor Statistics numbers — "
+    "when a free FRED API key is configured (see the code comment near FRED_SERIES_IDS); "
+    "otherwise figures are parsed from the latest *reputable-outlet* headline reporting each "
+    "release, live, every refresh — never from an unvetted source, and never displayed if the "
+    "extracted number falls outside a plausible range for that metric. These are only "
+    "released monthly, so a tile only changes when a new report actually comes out. Source: "
+    "U.S. Bureau of Labor Statistics (BLS)."
 )
 _render_employment(fetch_employment_data())
 
@@ -1287,7 +1243,6 @@ for tab, (market, data) in zip(loser_tabs, top_performers.items()):
 
 st.caption(
     "Data sources: Yahoo Finance (indices/currencies/commodities/VIX/yields/top performers), Google News RSS "
-    "(headlines, PMI, and unemployment/payrolls readings, prioritizing reputable outlets — ISM, NBS "
-    "China, S&P Global, SIPMM, BLS, MoSPI/CMIE, MOM Singapore). This is informational only, not "
-    "financial advice."
+    "(headlines, and US PMI/unemployment/payrolls readings, prioritizing reputable outlets — ISM, BLS). "
+    "This is informational only, not financial advice."
 )
