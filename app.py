@@ -20,7 +20,7 @@ import streamlit as st
 # CONFIG
 # ---------------------------------------------------------------------------
 
-CACHE_TTL = 300  # seconds between live re-fetches (5 min)
+CACHE_TTL = 60  # seconds between live re-fetches (1 min)
 
 TICKERS = {
     "S&P 500":            "^GSPC",
