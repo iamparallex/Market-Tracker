@@ -47,6 +47,19 @@ CURRENCIES = {
     "NZD/USD":                {"ticker": "NZDUSD=X", "invert": False},  # already NZD->USD
 }
 
+# Commodities section — live benchmark/spot prices sourced from the same
+# Yahoo Finance feed already used for indices and currencies above, so these
+# refresh on the same CACHE_TTL cycle rather than being a static figure.
+# "BZ=F" is the ICE Brent Crude near-month futures contract — the standard
+# live-quoted benchmark price for Brent crude. "XAUUSD=X"/"XAGUSD=X" are
+# Yahoo Finance's gold/silver SPOT (vs. USD) tickers, distinct from the
+# COMEX futures tickers (GC=F/SI=F), matching what was asked for.
+COMMODITIES = {
+    "Brent Crude":  {"ticker": "BZ=F",     "unit": "/bbl"},
+    "Gold Spot":    {"ticker": "XAUUSD=X", "unit": "/oz"},
+    "Silver Spot":  {"ticker": "XAGUSD=X", "unit": "/oz"},
+}
+
 # Curated set of large, liquid constituents from each market's major index,
 # used to surface the day's top performers. Not the full index membership
 # (some indexes, e.g. CSI 300, run to hundreds of names) — this is a
@@ -176,6 +189,8 @@ EMPLOYMENT_METRICS = {
         "variants": [
             "China surveyed urban unemployment rate NBS -youth",
             "China unemployment rate -youth",
+            "China jobless rate National Bureau Statistics",
+            "China urban unemployment rate percent",
         ],
     },
     ("India", "Unemployment Rate"): {
@@ -195,7 +210,7 @@ EMPLOYMENT_METRICS = {
         ],
     },
 }
-EMPLOYMENT_CANDIDATES_TO_SCAN = 8  # how many headlines per query variant to check for a parseable number
+EMPLOYMENT_CANDIDATES_TO_SCAN = 12  # how many headlines per query variant to check for a parseable number
 # Headlines containing any of these are skipped for rate parsing even if they
 # have a percent figure — they report a related-but-different, much more
 # volatile sub-metric (e.g. China and India both separately report youth
@@ -219,8 +234,8 @@ NEWS_FEEDS = {
     "China":         "https://news.google.com/rss/search?q=China+stock+market+CSI300+when:1d&hl=en-US&gl=US&ceid=US:en",
     "India":         "https://news.google.com/rss/search?q=India+stock+market+Sensex+Nifty+when:1d&hl=en-US&gl=US&ceid=US:en",
 }
-HEADLINES_PER_MARKET = 3  # target number of headlines from reputable outlets
-MIN_HEADLINES_PER_MARKET = 3  # absolute floor - backfilled from other outlets if needed
+HEADLINES_PER_MARKET = 5  # target number of headlines from reputable outlets
+MIN_HEADLINES_PER_MARKET = 5  # absolute floor - backfilled from other outlets if needed
 # Google News RSS returns many outlets of wildly varying quality. We prefer
 # headlines whose <source> matches one of these reputable, well-known
 # financial/general news outlets (case-insensitive substring match). If a
@@ -329,6 +344,23 @@ def fetch_currency_data():
 
 
 @st.cache_data(ttl=CACHE_TTL)
+def fetch_commodity_data():
+    """Live Brent crude / gold spot / silver spot prices from Yahoo Finance,
+    same live-refresh approach as fetch_currency_data above."""
+    rows = []
+    for label, meta in COMMODITIES.items():
+        try:
+            info = yf.Ticker(meta["ticker"]).fast_info
+            last, prev = info["lastPrice"], info["previousClose"]
+            pct = (last - prev) / prev * 100 if prev else 0.0
+            display = f"${last:,.2f}{meta['unit']}"
+            rows.append({"label": label, "value": display, "change_pct": pct})
+        except Exception as e:
+            rows.append({"label": label, "value": "N/A", "change_pct": None, "error": str(e)})
+    return rows
+
+
+@st.cache_data(ttl=CACHE_TTL)
 def fetch_top_performers():
     """For each market, fetch day-change % for a curated set of major-index
     constituents and return the top gainers and top losers, each sorted
@@ -378,11 +410,20 @@ def _build_item(entry, source):
     title = entry.get("title", "Untitled")
     clean_title = re.sub(r"\s*-\s*" + re.escape(source) + r"\s*$", "", title) if source else title
     link = entry.get("link", "")
+    # Google News RSS often puts a short blurb in <summary>/<description> that
+    # restates the headline with a bit more detail — sometimes including the
+    # actual figure even when the headline itself is narrative-only (e.g.
+    # "China factory activity expands again" with no number, but the summary
+    # says "...PMI rose to 53.3..."). Captured here so parsing can fall back
+    # to it instead of the number silently going undisplayed.
+    summary = entry.get("summary", "") or ""
+    summary = re.sub(r"<[^>]+>", " ", summary)  # strip any embedded HTML tags
     return {
         "title": clean_title,
         "link": link,
         "source": source,
         "published": entry.get("published", ""),
+        "summary": summary,
     }
 
 
@@ -519,9 +560,18 @@ def fetch_pmi_data():
                 if display_candidates and best_fallback_item is None:
                     best_fallback_item = display_candidates[0]
                 for item in reputable[:PMI_CANDIDATES_TO_SCAN]:
-                    if not _title_matches_pmi_kind(item["title"], kind):
+                    matches_kind = _title_matches_pmi_kind(item["title"], kind) or \
+                        _title_matches_pmi_kind(item.get("summary", ""), kind)
+                    if not matches_kind:
                         continue
                     value, prev = _parse_pmi_value(item["title"], keyword=kind)
+                    if value is None or not (PMI_VALID_RANGE[0] <= value <= PMI_VALID_RANGE[1]):
+                        # Headline alone didn't yield a trustworthy number —
+                        # try the RSS summary blurb, which often states the
+                        # figure explicitly even when the headline itself is
+                        # narrative-only (e.g. "China factory activity picks
+                        # up" vs. summary "...PMI rose to 53.3 in June...").
+                        value, prev = _parse_pmi_value(item.get("summary", ""), keyword=kind)
                     if value is not None and PMI_VALID_RANGE[0] <= value <= PMI_VALID_RANGE[1]:
                         parsed_item = {**item, "value": value, "prev": prev}
                         break
@@ -759,9 +809,25 @@ def fetch_employment_data():
                     if cfg["kind"] == "rate":
                         value, prev = _parse_rate_value(item["title"])
                         valid = value is not None and RATE_VALID_RANGE[0] <= value <= RATE_VALID_RANGE[1]
+                        if not valid:
+                            # Headline text alone often omits the number
+                            # (narrative-only wording); the RSS summary
+                            # blurb frequently states it explicitly, e.g.
+                            # "...unemployment rate held at 5.5% in June...".
+                            summary_text = item.get("summary", "")
+                            if summary_text and not any(
+                                term in summary_text.lower() for term in EMPLOYMENT_RATE_EXCLUDE_TERMS
+                            ):
+                                value, prev = _parse_rate_value(summary_text)
+                                valid = value is not None and RATE_VALID_RANGE[0] <= value <= RATE_VALID_RANGE[1]
                     else:
                         value, prev = _parse_payroll_value(item["title"]), None
                         valid = value is not None and PAYROLL_VALID_RANGE[0] <= value <= PAYROLL_VALID_RANGE[1]
+                        if not valid:
+                            summary_text = item.get("summary", "")
+                            if summary_text:
+                                value, prev = _parse_payroll_value(summary_text), None
+                                valid = value is not None and PAYROLL_VALID_RANGE[0] <= value <= PAYROLL_VALID_RANGE[1]
                     if valid:
                         parsed_item = {**item, "value": value, "prev": prev}
                         break
@@ -817,10 +883,10 @@ def fetch_news():
     return news
 
 
-def _render_ticker(index_rows, currency_rows):
+def _render_ticker(index_rows, currency_rows, commodity_rows=None):
     """Render a sleek, continuously-scrolling right-to-left ticker banner
-    summarizing every index and currency on the page."""
-    rows = list(index_rows) + list(currency_rows)
+    summarizing every index, currency, and commodity on the page."""
+    rows = list(index_rows) + list(currency_rows) + list(commodity_rows or [])
     items_html = []
     for row in rows:
         pct = row.get("change_pct")
@@ -899,6 +965,93 @@ def _render_ticker(index_rows, currency_rows):
     st.markdown(html, unsafe_allow_html=True)
 
 
+NEWS_MARKET_FLAGS = {
+    "United States": "🇺🇸",
+    "China": "🇨🇳",
+    "India": "🇮🇳",
+    "Singapore": "🇸🇬",
+}
+
+
+def _render_headline_banner(news):
+    """Render a compact secondary banner, directly under the main ticker,
+    showing the single top live headline for each tracked market (US, China,
+    India, Singapore) — same reputable-outlet-prioritized data as the News
+    section below, just surfaced at a glance without opening a tab."""
+    import html as _html
+
+    cards = []
+    for market in ("United States", "China", "India", "Singapore"):
+        items = news.get(market) or []
+        flag = NEWS_MARKET_FLAGS.get(market, "")
+        if not items:
+            cards.append(
+                f'<div class="headline-card"><div class="headline-market">{flag} {market}</div>'
+                f'<div class="headline-text">No headline available right now.</div></div>'
+            )
+            continue
+        top = items[0]
+        title = _html.escape(top.get("title") or "Untitled")
+        source = _html.escape(top.get("source") or "")
+        published = _html.escape(top.get("published") or "")
+        link = top.get("link") or ""
+        headline_html = f'<a href="{_html.escape(link)}" target="_blank">{title}</a>' if link else title
+        meta = " · ".join(x for x in (source, published) if x)
+        cards.append(
+            f'<div class="headline-card">'
+            f'<div class="headline-market">{flag} {market}</div>'
+            f'<div class="headline-text">{headline_html}</div>'
+            f'<div class="headline-source">{meta}</div>'
+            f'</div>'
+        )
+    html_out = f"""
+    <style>
+    .headline-banner {{
+        display: grid;
+        grid-template-columns: repeat(4, 1fr);
+        gap: 0.7rem;
+        margin-bottom: 1.4rem;
+    }}
+    .headline-card {{
+        background: linear-gradient(160deg, #12161f 0%, #0d1117 100%);
+        border: 1px solid rgba(255,255,255,0.08);
+        border-radius: 10px;
+        padding: 0.75rem 0.95rem;
+        min-height: 100px;
+    }}
+    .headline-market {{
+        color: #8b96a5;
+        font-size: 0.72rem;
+        font-weight: 700;
+        text-transform: uppercase;
+        letter-spacing: 0.03em;
+        margin-bottom: 0.4rem;
+    }}
+    .headline-text a {{
+        color: #f0f3f7;
+        text-decoration: none;
+    }}
+    .headline-text a:hover {{ text-decoration: underline; }}
+    .headline-text {{
+        font-size: 0.86rem;
+        font-weight: 600;
+        line-height: 1.35;
+        color: #f0f3f7;
+    }}
+    .headline-source {{
+        color: #6b7684;
+        font-size: 0.72rem;
+        margin-top: 0.5rem;
+    }}
+    @media (max-width: 900px) {{
+        .headline-banner {{ grid-template-columns: repeat(2, 1fr); }}
+    }}
+    </style>
+    <div class="headline-banner">{''.join(cards)}</div>
+    """
+    st.markdown(html_out, unsafe_allow_html=True)
+
+
 def _render_pmi(pmi_data):
     """Render Manufacturing & Services PMI, grouped by country. Each reading
     is live-fetched (see fetch_pmi_data); if we could parse a number out of
@@ -927,11 +1080,17 @@ def _render_pmi(pmi_data):
                     else:
                         st.metric(f"{kind} PMI", f"{item['value']:.1f}")
                 else:
+                    # No number could be confidently parsed — still surface
+                    # the actual headline text (not just a bare label) so
+                    # the person can see what was found and click through,
+                    # rather than the tile looking like nothing loaded.
                     st.markdown(f"**{kind} PMI**")
+                    if item.get("title"):
+                        st.caption(item["title"])
                 if item["link"]:
                     st.caption(f"[{item['source'] or 'source'}]({item['link']}) · {item['published']}")
-                else:
-                    st.caption(item["title"])
+                elif not item["value"] and not item.get("title"):
+                    st.caption("_no parseable figure found — try 🔄 Refresh._")
 
 
 def _render_employment(employment_data):
@@ -963,11 +1122,17 @@ def _render_employment(employment_data):
                     else:  # payrolls, in jobs added/lost
                         st.metric(metric, f"{item['value']:+,.0f} jobs")
                 else:
+                    # No number could be confidently parsed — still surface
+                    # the actual headline text (not just a bare label) so
+                    # the person can see what was found and click through,
+                    # rather than the tile looking like nothing loaded.
                     st.markdown(f"**{metric}**")
+                    if item.get("title"):
+                        st.caption(item["title"])
                 if item["link"]:
                     st.caption(f"[{item['source'] or 'source'}]({item['link']}) · {item['published']}")
-                else:
-                    st.caption(item["title"])
+                elif not item["value"] and not item.get("title"):
+                    st.caption("_no parseable figure found — try 🔄 Refresh._")
 
 
 # ---------------------------------------------------------------------------
@@ -982,7 +1147,12 @@ st.caption(f"Last refreshed: {datetime.datetime.now().strftime('%A, %d %b %Y %H:
 if st.button("🔄 Refresh now"):
     st.cache_data.clear()
 
-_render_ticker(fetch_index_data(), fetch_currency_data())
+_render_ticker(fetch_index_data(), fetch_currency_data(), fetch_commodity_data())
+
+# Fetched once here and reused below for the News section too — fetch_news()
+# is @st.cache_data'd, so calling it again later costs nothing extra.
+news = fetch_news()
+_render_headline_banner(news)
 
 st.subheader("Global Indices")
 cols = st.columns(3)
@@ -997,6 +1167,21 @@ st.subheader("💱 Currencies")
 currency_cols = st.columns(3)
 for i, row in enumerate(fetch_currency_data()):
     with currency_cols[i % 3]:
+        if row.get("change_pct") is None:
+            st.metric(row["label"], row["value"])
+        else:
+            st.metric(row["label"], row["value"], f"{row['change_pct']:+.2f}%")
+
+st.subheader("🛢️ Commodities")
+st.caption(
+    "Live prices from Yahoo Finance, the same live feed used for indices and "
+    "currencies above. Brent Crude is the ICE near-month futures contract — "
+    "the standard live benchmark quote; Gold Spot and Silver Spot are "
+    "Yahoo Finance's live spot-vs-USD tickers."
+)
+commodity_cols = st.columns(3)
+for i, row in enumerate(fetch_commodity_data()):
+    with commodity_cols[i % 3]:
         if row.get("change_pct") is None:
             st.metric(row["label"], row["value"])
         else:
@@ -1037,7 +1222,8 @@ _render_employment(fetch_employment_data())
 st.subheader("📰 Live Market News — SG, US, China, India")
 st.caption(f"Prioritizes reputable outlets (Reuters, Bloomberg, CNBC, FT, WSJ, AP, BBC, and similar); "
            f"backfilled with other outlets so each tab always shows at least {MIN_HEADLINES_PER_MARKET} headlines.")
-news = fetch_news()
+# `news` was already fetched above (for the headline banner); fetch_news()
+# is cached, so reusing that same call here costs nothing extra.
 tabs = st.tabs(list(news.keys()))
 for tab, (market, items) in zip(tabs, news.items()):
     with tab:
@@ -1100,7 +1286,7 @@ for tab, (market, data) in zip(loser_tabs, top_performers.items()):
         _render_performer_rows(data["losers"], market)
 
 st.caption(
-    "Data sources: Yahoo Finance (indices/currencies/VIX/yields/top performers), Google News RSS "
+    "Data sources: Yahoo Finance (indices/currencies/commodities/VIX/yields/top performers), Google News RSS "
     "(headlines, PMI, and unemployment/payrolls readings, prioritizing reputable outlets — ISM, NBS "
     "China, S&P Global, SIPMM, BLS, MoSPI/CMIE, MOM Singapore). This is informational only, not "
     "financial advice."
