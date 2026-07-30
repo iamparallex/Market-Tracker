@@ -132,8 +132,21 @@ TOP_STOCKS_UNIVERSE = {
 # wide enough to span a monthly release cycle even if a source reports late.
 # Primary reputable compiler: Institute for Supply Management (ISM).
 PMI_QUERY_VARIANTS = {
-    ("United States", "Manufacturing"): ['"ISM Manufacturing PMI"'],
-    ("United States", "Services"):      ['"ISM Services PMI"'],
+    ("United States", "Manufacturing"): ['"ISM Manufacturing PMI"', '"ISM Manufacturing Index"'],
+    # ISM renamed this release from "Non-Manufacturing Index" to "Services
+    # PMI" in 2024, so outlets still use a mix of both names, plus "services
+    # index"/"services sector" phrasing that doesn't include the word "PMI"
+    # at all — a single quoted "ISM Services PMI" variant was matching far
+    # fewer live headlines than the manufacturing query above, which is why
+    # this tile was regularly coming back empty. Multiple variants (mirroring
+    # the redundancy already used for the employment metrics below) make it
+    # just as likely to find a parseable headline as Manufacturing is.
+    ("United States", "Services"): [
+        '"ISM Services PMI"',
+        '"ISM Services Index"',
+        '"ISM Non-Manufacturing"',
+        "ISM services sector PMI",
+    ],
 }
 PMI_CANDIDATES_TO_SCAN = 8  # how many headlines per query variant to check for a parseable number
 
@@ -349,11 +362,19 @@ def _fetch_universe_data():
 
 def fetch_top_performers():
     """For each market, return the top gainers and top losers from the
-    shared universe data, each sorted most-extreme-first."""
+    shared universe data, each sorted most-extreme-first.
+
+    Gainers and losers are filtered to their own sign *before* ranking, so
+    a market with fewer than TOP_PERFORMERS_COUNT actual decliners (say)
+    shows only the losers that genuinely exist that day rather than padding
+    the list out with flat/gaining names just to reach a round number of
+    rows — the two segments never share a ticker."""
     results = {}
     for market, rows in _fetch_universe_data().items():
-        gainers = sorted(rows, key=lambda r: r["change_pct"], reverse=True)[:TOP_PERFORMERS_COUNT]
-        losers = sorted(rows, key=lambda r: r["change_pct"])[:TOP_PERFORMERS_COUNT]
+        gains = [r for r in rows if r["change_pct"] > 0]
+        losses = [r for r in rows if r["change_pct"] < 0]
+        gainers = sorted(gains, key=lambda r: r["change_pct"], reverse=True)[:TOP_PERFORMERS_COUNT]
+        losers = sorted(losses, key=lambda r: r["change_pct"])[:TOP_PERFORMERS_COUNT]
         results[market] = {"gainers": gainers, "losers": losers}
     return results
 
@@ -1094,11 +1115,127 @@ def _render_us_economic_indicators(pmi_data, employment_data):
 
 
 
+def _inject_global_css():
+    """One global dark theme so the rest of the page (metrics, tabs, buttons,
+    alerts, headers) matches the card styling the ticker/headline-banner/
+    mover-card sections already use, instead of sitting on Streamlit's plain
+    default background."""
+    st.markdown(
+        """
+        <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');
+
+        html, body, [class*="css"] { font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif; }
+
+        .stApp {
+            background: radial-gradient(circle at 15% 0%, #141a24 0%, #0a0d12 45%, #05070a 100%);
+            color: #eef1f6;
+        }
+        [data-testid="stHeader"] { background: transparent; }
+        .block-container { padding-top: 2rem; padding-bottom: 3rem; max-width: 1200px; }
+
+        /* Hero title */
+        h1 {
+            font-weight: 800 !important;
+            letter-spacing: -0.02em;
+            background: linear-gradient(90deg, #f0f3f7 0%, #b9c8e0 55%, #7dd3fc 100%);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+            margin-bottom: 0.1rem !important;
+        }
+
+        /* Section headers */
+        h2, h3 {
+            color: #eef1f6 !important;
+            font-weight: 700 !important;
+            letter-spacing: -0.01em;
+            margin-top: 2.2rem !important;
+            padding-bottom: 0.45rem;
+            border-bottom: 1px solid rgba(255,255,255,0.08);
+        }
+
+        /* Captions */
+        [data-testid="stCaptionContainer"], small { color: #7c879a !important; }
+
+        /* Metrics -> cards, matching the mover/ticker card language */
+        [data-testid="stMetric"] {
+            background: linear-gradient(160deg, rgba(255,255,255,0.05) 0%, rgba(255,255,255,0.02) 100%);
+            border: 1px solid rgba(255,255,255,0.08);
+            border-radius: 12px;
+            padding: 0.9rem 1rem 0.7rem;
+            transition: transform 0.15s ease, border-color 0.15s ease;
+        }
+        [data-testid="stMetric"]:hover {
+            transform: translateY(-2px);
+            border-color: rgba(125,211,252,0.35);
+        }
+        [data-testid="stMetricLabel"] {
+            color: #8b96a5 !important;
+            font-size: 0.78rem !important;
+            font-weight: 600 !important;
+            text-transform: uppercase;
+            letter-spacing: 0.03em;
+        }
+        [data-testid="stMetricValue"] {
+            color: #f0f3f7 !important;
+            font-weight: 700 !important;
+            font-variant-numeric: tabular-nums;
+        }
+
+        /* Buttons */
+        .stButton>button {
+            background: linear-gradient(135deg, #1c2433 0%, #12161f 100%);
+            border: 1px solid rgba(255,255,255,0.14);
+            color: #f0f3f7;
+            border-radius: 8px;
+            font-weight: 600;
+            padding: 0.45rem 1.2rem;
+            transition: all 0.15s ease;
+        }
+        .stButton>button:hover { border-color: #7dd3fc; color: #7dd3fc; }
+
+        /* Tabs */
+        .stTabs [data-baseweb="tab-list"] { gap: 4px; border-bottom: 1px solid rgba(255,255,255,0.08); }
+        .stTabs [data-baseweb="tab"] {
+            background: transparent;
+            color: #8b96a5;
+            font-weight: 600;
+            border-radius: 8px 8px 0 0;
+            padding: 0.5rem 1rem;
+        }
+        .stTabs [aria-selected="true"] {
+            background: rgba(125,211,252,0.08) !important;
+            color: #eef1f6 !important;
+            border-bottom: 2px solid #7dd3fc !important;
+        }
+
+        /* Alerts (e.g. the "no big movers" success box) */
+        .stAlert {
+            background: rgba(61,220,132,0.08) !important;
+            border: 1px solid rgba(61,220,132,0.35) !important;
+            border-radius: 10px;
+        }
+        .stAlert p { color: #eef1f6 !important; }
+
+        hr { border-color: rgba(255,255,255,0.08) !important; }
+
+        ::-webkit-scrollbar { width: 10px; height: 10px; }
+        ::-webkit-scrollbar-track { background: #0a0d12; }
+        ::-webkit-scrollbar-thumb { background: #2a3240; border-radius: 6px; }
+        ::-webkit-scrollbar-thumb:hover { background: #3a4456; }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
 # ---------------------------------------------------------------------------
 # UI
 # ---------------------------------------------------------------------------
 
 st.set_page_config(page_title="Market Tracker", page_icon="📈", layout="wide")
+_inject_global_css()
 st.title("📈 Market Tracker")
 st.caption(f"Last refreshed: {datetime.datetime.now().strftime('%A, %d %b %Y %H:%M')} "
            f"· Auto-refreshes every {CACHE_TTL // 60} min")
@@ -1267,8 +1404,9 @@ def _render_big_movers(movers, threshold):
 
 st.subheader("📈 Top 10 Gainers Today")
 st.caption(
-    f"Top {TOP_PERFORMERS_COUNT} gainers today from a curated set of large, liquid constituents "
-    "of each market's major index (S&P 500 · CSI 300 · Nifty 50 · STI). Prices shown in each "
+    f"Up to {TOP_PERFORMERS_COUNT} gainers today from a curated set of large, liquid constituents "
+    "of each market's major index (S&P 500 · CSI 300 · Nifty 50 · STI) — only names actually up on "
+    "the day are shown, so the list may be shorter on a broadly red day. Prices shown in each "
     "market's local currency."
 )
 top_performers = fetch_top_performers()
@@ -1279,7 +1417,8 @@ for tab, (market, data) in zip(gainer_tabs, top_performers.items()):
 
 st.subheader("📉 Top 10 Losers Today")
 st.caption(
-    f"Top {TOP_PERFORMERS_COUNT} losers today from the same curated set of constituents. "
+    f"Up to {TOP_PERFORMERS_COUNT} losers today from the same curated set of constituents — only "
+    "names actually down on the day are shown, so the list may be shorter on a broadly green day. "
     "Prices shown in each market's local currency."
 )
 loser_tabs = st.tabs(list(top_performers.keys()))
