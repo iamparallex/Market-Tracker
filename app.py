@@ -20,7 +20,7 @@ import streamlit as st
 # CONFIG
 # ---------------------------------------------------------------------------
 
-CACHE_TTL = 60  # seconds between live re-fetches (1 min)
+CACHE_TTL = 300  # seconds between live re-fetches (5 min)
 
 TICKERS = {
     "S&P 500":            "^GSPC",
@@ -164,6 +164,7 @@ EMPLOYMENT_CANDIDATES_TO_SCAN = 12  # how many headlines per query variant to ch
 EMPLOYMENT_RATE_EXCLUDE_TERMS = ["youth", "graduate", "young people"]
 
 TOP_PERFORMERS_COUNT = 10  # how many top gainers to show per market
+BIG_MOVER_THRESHOLD_PCT = 10.0  # abs(change %) at/above which a ticker counts as a "big mover"
 
 # Currency each market's share prices are quoted in (for display purposes).
 MARKET_CURRENCY = {
@@ -324,10 +325,11 @@ def fetch_commodity_data():
 
 
 @st.cache_data(ttl=CACHE_TTL)
-def fetch_top_performers():
-    """For each market, fetch day-change % for a curated set of major-index
-    constituents and return the top gainers and top losers, each sorted
-    most-extreme-first."""
+def _fetch_universe_data():
+    """For each market, fetch day-change % for every ticker in its curated
+    universe of major-index constituents. This is the single shared data
+    pull that both fetch_top_performers() and fetch_big_movers() derive
+    from, so refreshing doesn't hit Yahoo Finance twice for the same names."""
     results = {}
     for market, universe in TOP_STOCKS_UNIVERSE.items():
         rows = []
@@ -341,10 +343,33 @@ def fetch_top_performers():
                 rows.append({"ticker": ticker, "name": name, "price": last, "change_pct": pct})
             except Exception:
                 continue
+        results[market] = rows
+    return results
+
+
+def fetch_top_performers():
+    """For each market, return the top gainers and top losers from the
+    shared universe data, each sorted most-extreme-first."""
+    results = {}
+    for market, rows in _fetch_universe_data().items():
         gainers = sorted(rows, key=lambda r: r["change_pct"], reverse=True)[:TOP_PERFORMERS_COUNT]
         losers = sorted(rows, key=lambda r: r["change_pct"])[:TOP_PERFORMERS_COUNT]
         results[market] = {"gainers": gainers, "losers": losers}
     return results
+
+
+def fetch_big_movers(threshold=BIG_MOVER_THRESHOLD_PCT):
+    """Flatten every market's universe into a single list of tickers whose
+    day change is at/beyond +/- threshold percent, sorted by magnitude of
+    the swing (largest first). Each row is tagged with its market so they
+    can all be shown together."""
+    movers = []
+    for market, rows in _fetch_universe_data().items():
+        for row in rows:
+            if abs(row["change_pct"]) >= threshold:
+                movers.append({**row, "market": market})
+    movers.sort(key=lambda r: abs(r["change_pct"]), reverse=True)
+    return movers
 
 
 def _source_name(entry):
@@ -1161,25 +1186,83 @@ for tab, (market, items) in zip(tabs, news.items()):
                 st.caption(meta)
             st.divider()
 
+_UP_COLOR = "#16a34a"    # green-600
+_DOWN_COLOR = "#dc2626"  # red-600
+
+
+def _mover_card_html(rank_label, name, ticker, price, currency, pct, bar_pct, extra_badge=""):
+    """Build one styled HTML row: colored side-bar, name/ticker, price,
+    a pill showing the %, and a small magnitude bar so the size of the move
+    is visible at a glance, not just its sign."""
+    is_up = pct >= 0
+    color = _UP_COLOR if is_up else _DOWN_COLOR
+    bg = "rgba(22,163,74,0.08)" if is_up else "rgba(220,38,38,0.08)"
+    arrow = "▲" if is_up else "▼"
+    bar_pct = max(4, min(100, bar_pct))
+    price_str = f"{price:,.2f} {currency}".strip()
+    return f"""
+    <div style="display:flex;align-items:center;gap:14px;padding:10px 14px;margin-bottom:6px;
+                border-radius:10px;background:{bg};border-left:4px solid {color};">
+        <div style="flex:0 0 30px;font-weight:700;color:#94a3b8;font-size:0.85em;">{rank_label}</div>
+        <div style="flex:1;min-width:0;">
+            <div style="font-weight:600;font-size:1em;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">
+                {name}{extra_badge}
+            </div>
+            <div style="font-size:0.78em;color:#94a3b8;font-family:monospace;">{ticker}</div>
+        </div>
+        <div style="flex:0 0 120px;text-align:right;font-variant-numeric:tabular-nums;font-size:0.92em;">
+            {price_str}
+        </div>
+        <div style="flex:0 0 130px;text-align:right;">
+            <div style="display:inline-block;padding:3px 10px;border-radius:999px;background:{color};
+                        color:white;font-weight:700;font-size:0.88em;white-space:nowrap;">
+                {arrow} {pct:+.2f}%
+            </div>
+            <div style="height:4px;border-radius:2px;background:rgba(148,163,184,0.3);margin-top:5px;overflow:hidden;">
+                <div style="height:100%;width:{bar_pct:.0f}%;background:{color};margin-left:auto;"></div>
+            </div>
+        </div>
+    </div>
+    """
+
+
 def _render_performer_rows(rows, market):
     if not rows:
         st.markdown("_No data available right now._")
         return
-    for rank, row in enumerate(rows, start=1):
-        pcol, ncol, vcol, ccol = st.columns([0.5, 3, 2, 2])
-        with pcol:
-            st.markdown(f"**#{rank}**")
-        with ncol:
-            st.markdown(f"**{row['name']}**")
-            st.caption(row["ticker"])
-        with vcol:
-            currency = MARKET_CURRENCY.get(market, "")
-            st.markdown(f"{row['price']:,.2f} {currency}")
-        with ccol:
-            pct = row["change_pct"]
-            arrow = "▲" if pct >= 0 else "▼"
-            color = "green" if pct >= 0 else "red"
-            st.markdown(f":{color}[{arrow} {pct:+.2f}%]")
+    currency = MARKET_CURRENCY.get(market, "")
+    max_abs = max((abs(r["change_pct"]) for r in rows), default=1.0) or 1.0
+    html = "".join(
+        _mover_card_html(
+            f"#{rank}", row["name"], row["ticker"], row["price"], currency,
+            row["change_pct"], abs(row["change_pct"]) / max_abs * 100,
+        )
+        for rank, row in enumerate(rows, start=1)
+    )
+    st.markdown(html, unsafe_allow_html=True)
+
+
+def _render_big_movers(movers, threshold):
+    """Flat, magnitude-sorted list of every ticker (across all tracked
+    markets) whose day change is at/beyond +/- threshold percent."""
+    if not movers:
+        st.success(f"✅ No ticker in the tracked universe has swung ±{threshold:.0f}% or more today.")
+        return
+    max_abs = max(abs(r["change_pct"]) for r in movers)
+    html = "".join(
+        _mover_card_html(
+            "🚨", row["name"], row["ticker"], row["price"],
+            MARKET_CURRENCY.get(row["market"], ""), row["change_pct"],
+            abs(row["change_pct"]) / max_abs * 100,
+            extra_badge=(
+                f'<span style="margin-left:8px;padding:1px 8px;border-radius:999px;'
+                f'background:rgba(148,163,184,0.25);color:#94a3b8;font-size:0.72em;'
+                f'font-weight:600;vertical-align:middle;">{row["market"]}</span>'
+            ),
+        )
+        for row in movers
+    )
+    st.markdown(html, unsafe_allow_html=True)
 
 
 st.subheader("📈 Top 10 Gainers Today")
@@ -1203,6 +1286,16 @@ loser_tabs = st.tabs(list(top_performers.keys()))
 for tab, (market, data) in zip(loser_tabs, top_performers.items()):
     with tab:
         _render_performer_rows(data["losers"], market)
+
+st.subheader("🚨 Big Movers — ±10% Swings")
+st.caption(
+    f"Every ticker across the tracked universe (S&P 500 · CSI 300 · Nifty 50 · STI constituents) "
+    f"whose price has swung {BIG_MOVER_THRESHOLD_PCT:.0f}% or more today, up or down, sorted by the "
+    "size of the move. Pulls from the same curated constituent list and live data as the gainers/"
+    "losers sections above, so it costs no extra API calls."
+)
+big_movers = fetch_big_movers()
+_render_big_movers(big_movers, BIG_MOVER_THRESHOLD_PCT)
 
 st.caption(
     "Data sources: Yahoo Finance (indices/currencies/commodities/VIX/yields/top performers), Google News RSS "
